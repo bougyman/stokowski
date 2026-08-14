@@ -6,6 +6,10 @@ All notable changes to Stokowski are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- feat: optionally scope each Linear tracker to issues assigned to the API key's authenticated user with `tracker.assignee: me`
+
 ### Fixed
 
 - Stream readable Codex JSONL activity into the terminal and dashboard, drain diagnostic stderr concurrently, report hook completion and captured output, and kill the complete Codex process group after stalls or timeouts.
