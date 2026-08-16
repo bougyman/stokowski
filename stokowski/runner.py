@@ -1,4 +1,4 @@
-"""Agent runner - launches Claude Code in headless mode and streams results."""
+"""Agent runner - launches Claude Code or Codex in headless mode."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ClaudeConfig, HooksConfig
+from .config import CODEX_REASONING_EFFORTS, ClaudeConfig, HooksConfig
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
@@ -176,8 +176,15 @@ def build_codex_args(
     model: str | None,
     prompt: str,
     workspace_path: Path,
+    reasoning_effort: str | None = None,
 ) -> list[str]:
-    """Build the codex CLI argument list."""
+    """Build a non-interactive Codex JSONL invocation."""
+    if (
+        reasoning_effort is not None
+        and reasoning_effort not in CODEX_REASONING_EFFORTS
+    ):
+        raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort!r}")
+
     args = [
         "codex",
         "exec",
@@ -194,6 +201,10 @@ def build_codex_args(
     ]
     if model:
         args.extend(["--model", model])
+    if reasoning_effort:
+        args.extend(
+            ["--config", f'model_reasoning_effort="{reasoning_effort}"']
+        )
     args.append(prompt)
     return args
 
@@ -205,6 +216,7 @@ async def run_codex_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
+    reasoning_effort: str | None = None,
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     turn_timeout_ms: int = 3_600_000,
@@ -216,7 +228,7 @@ async def run_codex_turn(
     Codex sessions are ephemeral here, so each state gets a fresh run. JSONL
     output keeps the activity monitor updated during long-running turns.
     """
-    args = build_codex_args(model, prompt, workspace_path)
+    args = build_codex_args(model, prompt, workspace_path, reasoning_effort)
 
     # Run before_run hook
     if hooks_cfg.before_run:
@@ -311,9 +323,9 @@ async def run_codex_turn(
 
     async def stall_monitor():
         while proc.returncode is None:
-            await asyncio.sleep(min(stall_timeout_s / 4, 30))
+            await asyncio.sleep(max(0.1, min(stall_timeout_s / 4, 30)))
             elapsed = loop.time() - last_activity
-            if stall_timeout_s > 0 and elapsed > stall_timeout_s:
+            if elapsed > stall_timeout_s:
                 logger.warning(
                     f"Codex stall detected issue={issue.identifier} "
                     f"elapsed={elapsed:.0f}s",
@@ -660,6 +672,7 @@ async def run_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
+    reasoning_effort: str | None = None,
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
@@ -668,6 +681,7 @@ async def run_turn(
     if runner_type == "codex":
         return await run_codex_turn(
             model=claude_cfg.model,
+            reasoning_effort=reasoning_effort,
             hooks_cfg=hooks_cfg,
             prompt=prompt,
             workspace_path=workspace_path,

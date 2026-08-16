@@ -14,6 +14,10 @@ import yaml
 
 log = logging.getLogger(__name__)
 
+CODEX_REASONING_EFFORTS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh"}
+)
+
 
 @dataclass
 class TrackerConfig:
@@ -107,6 +111,7 @@ class StateConfig:
     linear_state: str = "active"     # key into LinearStatesConfig
     runner: str = "claude"
     model: str | None = None
+    reasoning_effort: str | None = None
     max_turns: int | None = None
     turn_timeout_ms: int | None = None
     stall_timeout_ms: int | None = None
@@ -348,6 +353,11 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         linear_state=str(raw.get("linear_state", "active")),
         runner=str(raw.get("runner", "claude")),
         model=raw.get("model"),
+        reasoning_effort=(
+            str(raw["reasoning_effort"]).strip().lower()
+            if raw.get("reasoning_effort") is not None
+            else None
+        ),
         max_turns=raw.get("max_turns"),
         turn_timeout_ms=raw.get("turn_timeout_ms"),
         stall_timeout_ms=raw.get("stall_timeout_ms"),
@@ -369,7 +379,11 @@ def merge_state_config(
         command=root_claude.command,
         permission_mode=state.permission_mode or root_claude.permission_mode,
         allowed_tools=state.allowed_tools if state.allowed_tools is not None else root_claude.allowed_tools,
-        model=state.model or root_claude.model,
+        model=(
+            state.model
+            if state.model is not None
+            else (None if state.runner == "codex" else root_claude.model)
+        ),
         max_turns=state.max_turns if state.max_turns is not None else root_claude.max_turns,
         turn_timeout_ms=state.turn_timeout_ms if state.turn_timeout_ms is not None else root_claude.turn_timeout_ms,
         stall_timeout_ms=state.stall_timeout_ms if state.stall_timeout_ms is not None else root_claude.stall_timeout_ms,
@@ -652,6 +666,22 @@ def _validate_project(project: ProjectConfig, errors: list[str]) -> None:
             has_agent = True
             if not sc.prompt:
                 errors.append(f"{prefix} state '{name}': agent state missing 'prompt' field")
+            if sc.runner not in ("claude", "codex"):
+                errors.append(
+                    f"{prefix} state '{name}': unsupported runner: {sc.runner}"
+                )
+            if (
+                sc.reasoning_effort is not None
+                and sc.reasoning_effort not in CODEX_REASONING_EFFORTS
+            ):
+                errors.append(
+                    f"{prefix} state '{name}': unsupported reasoning_effort: "
+                    f"{sc.reasoning_effort!r}"
+                )
+            elif sc.reasoning_effort is not None and sc.runner != "codex":
+                errors.append(
+                    f"{prefix} state '{name}': reasoning_effort requires runner: codex"
+                )
 
         elif sc.type == "gate":
             if not sc.rework_to:

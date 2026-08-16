@@ -9,6 +9,11 @@ All notable changes to Stokowski are documented here.
 ### Added
 
 - feat: optionally scope each Linear tracker to issues assigned to the API key's authenticated user with `tracker.assignee: me`
+- feat: configure Codex reasoning effort per state with `reasoning_effort`
+
+### Changed
+
+- fix: launch Codex through the current non-interactive `codex exec` command
 
 ### Fixed
 

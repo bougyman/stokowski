@@ -11,7 +11,7 @@ This file is the single source of truth for contributors. It covers architecture
 Stokowski is a long-running Python daemon that:
 1. Polls Linear for issues in configured active states
 2. Creates an isolated git-cloned workspace per issue
-3. Launches Claude Code (`claude -p`) in that workspace
+3. Launches the configured agent (`claude -p` or `codex exec`) in that workspace
 4. Manages multi-turn sessions via `--resume <session_id>`
 5. Retries failures with exponential backoff
 6. Reconciles running agents against Linear state changes
@@ -30,7 +30,7 @@ stokowski/
   models.py        Domain models: Issue, RunAttempt, RetryEntry
   orchestrator.py  Main poll loop, dispatch, reconciliation, retry
   prompt.py        Three-layer prompt assembly for state machine workflows
-  runner.py        Claude Code CLI integration, stream-json parser
+  runner.py        Claude Code and Codex CLI integration, stream parser
   tracking.py      State machine tracking via structured Linear comments
   workspace.py     Per-issue workspace lifecycle and hooks
   web.py           Optional FastAPI dashboard
@@ -49,6 +49,10 @@ Symphony uses Codex's JSON-RPC `app-server` protocol over stdio. Stokowski uses 
 
 `--verbose` is required for `stream-json` to work. `session_id` is extracted from the `result` event in the NDJSON stream.
 
+Codex states use its non-interactive CLI path:
+- `codex exec --sandbox workspace-write --ephemeral --json --cd <workspace> <prompt>`
+- optional per-state `model` and `reasoning_effort` values become CLI overrides
+
 ### Python + asyncio instead of Elixir/OTP
 Simpler operational story — single process, no BEAM runtime, no distributed concerns. Concurrency via `asyncio.create_task`. Each agent turn is a subprocess launched with `asyncio.create_subprocess_exec`.
 
@@ -59,7 +63,7 @@ All state lives in memory. The orchestrator recovers from restart by re-polling 
 The operator's `workflow.yaml` defines the runtime config and state machine. Stokowski re-parses it on every poll tick — config changes take effect without restart. Both `.yaml` and legacy `.md` (YAML front matter + Jinja2 body) formats are supported. Prompt templates are now separate `.md` files referenced by path from the config.
 
 ### State machine workflow
-Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs Claude Code), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
+Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs the configured Claude or Codex runner), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
 
 **Three-layer prompt assembly:** Every agent turn's prompt is built from three layers concatenated together:
 1. **Global prompt** — shared context loaded from a `.md` file (referenced by `prompts.global_prompt`)
@@ -91,7 +95,7 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `ServerConfig` — optional web dashboard port
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
 - `PromptsConfig` — global prompt file reference
-- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, Codex reasoning effort, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
 
 `ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
 
@@ -149,7 +153,7 @@ while running:
 **Shutdown:** `stop()` sets `_stop_event`, kills all child PIDs via `os.killpg`, cancels async tasks.
 
 ### runner.py
-`run_agent_turn()` builds CLI args, launches subprocess, streams NDJSON output.
+`run_agent_turn()` builds Claude CLI args and streams NDJSON output. Codex states route through `run_codex_turn()` and the non-interactive `codex exec` command.
 
 **PID tracking:** `on_pid` callback registers/unregisters child PIDs with the orchestrator for clean shutdown.
 
@@ -226,10 +230,11 @@ workflow.yaml parsed → states + config loaded
         → _run_worker() task spawned
             → ensure_workspace() → after_create hook (git clone, npm install, etc.)
             → assemble_prompt() → 3 layers: global + stage + lifecycle
-            → run_agent_turn() called in loop (up to max_turns)
-                → build_claude_args() → claude -p subprocess
-                → NDJSON streamed: tool_use events, assistant messages, result
-                → session_id captured for next turn
+            → run_turn() called in loop (up to max_turns)
+                ├── Claude: build_claude_args() → claude -p subprocess
+                │   → NDJSON streamed; session_id captured for next turn
+                └── Codex: build_codex_args() → codex exec subprocess
+                    → JSONL activity on stdout; diagnostics on stderr
             → _on_worker_exit() called
                 → state transition on success → tracking comment posted
                 → tokens/timing aggregated
