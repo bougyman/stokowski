@@ -1,4 +1,4 @@
-"""Agent runner - launches Claude Code in headless mode and streams results."""
+"""Agent runner - launches Claude Code or Codex in headless mode."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ClaudeConfig, HooksConfig
+from .config import CODEX_REASONING_EFFORTS, ClaudeConfig, HooksConfig
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
@@ -67,12 +67,34 @@ def build_codex_args(
     model: str | None,
     prompt: str,
     workspace_path: Path,
+    reasoning_effort: str | None = None,
 ) -> list[str]:
-    """Build the codex CLI argument list."""
-    args = ["codex", "--quiet"]
+    """Build a non-interactive Codex CLI invocation."""
+    if (
+        reasoning_effort is not None
+        and reasoning_effort not in CODEX_REASONING_EFFORTS
+    ):
+        raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort!r}")
+
+    args = ["codex"]
     if model:
         args.extend(["--model", model])
-    args.extend(["--prompt", prompt])
+    if reasoning_effort:
+        args.extend(
+            ["--config", f'model_reasoning_effort="{reasoning_effort}"']
+        )
+    args.extend(
+        [
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "--cd",
+            str(workspace_path.resolve()),
+            "exec",
+            prompt,
+        ]
+    )
     return args
 
 
@@ -83,6 +105,7 @@ async def run_codex_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
+    reasoning_effort: str | None = None,
     on_pid: PidCallback | None = None,
     turn_timeout_ms: int = 3_600_000,
     stall_timeout_ms: int = 300_000,
@@ -90,10 +113,10 @@ async def run_codex_turn(
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
-    Codex doesn't support session resumption or stream-json output.
-    We capture stdout/stderr and use exit code for status.
+    This runner uses Codex's non-interactive ``exec`` command. We capture
+    stdout/stderr and use its exit code for status.
     """
-    args = build_codex_args(model, prompt, workspace_path)
+    args = build_codex_args(model, prompt, workspace_path, reasoning_effort)
 
     logger.info(
         f"Launching codex issue={issue.identifier} "
@@ -141,26 +164,33 @@ async def run_codex_turn(
     stall_timeout_s = stall_timeout_ms / 1000
     turn_timeout_s = turn_timeout_ms / 1000
 
-    async def read_stream():
+    async def read_stream(
+        stream: asyncio.StreamReader,
+        *,
+        update_message: bool,
+    ) -> str:
         nonlocal last_activity
-        output_lines = []
+        output_lines: list[str] = []
         while True:
-            line = await proc.stdout.readline()
+            line = await stream.readline()
             if not line:
                 break
             last_activity = loop.time()
             attempt.last_event_at = datetime.now(timezone.utc)
-            line_str = line.decode().strip()
+            line_str = line.decode(errors="replace").strip()
             if line_str:
-                output_lines.append(line_str)
-                attempt.last_message = line_str[:200]
-        return output_lines
+                output_lines.append(line_str[-2000:])
+                if len(output_lines) > 50:
+                    del output_lines[0]
+                if update_message:
+                    attempt.last_message = line_str[:200]
+        return "\n".join(output_lines)
 
     async def stall_monitor():
         while proc.returncode is None:
-            await asyncio.sleep(min(stall_timeout_s / 4, 30))
+            await asyncio.sleep(max(0.1, min(stall_timeout_s / 4, 30)))
             elapsed = loop.time() - last_activity
-            if stall_timeout_s > 0 and elapsed > stall_timeout_s:
+            if elapsed > stall_timeout_s:
                 logger.warning(
                     f"Codex stall detected issue={issue.identifier} "
                     f"elapsed={elapsed:.0f}s",
@@ -171,47 +201,67 @@ async def run_codex_turn(
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
 
+    # ``codex exec`` streams progress to stderr and the final response to
+    # stdout. Drain both so progress resets stall detection and neither pipe
+    # can fill while the subprocess is running.
+    stdout_reader = asyncio.create_task(
+        read_stream(proc.stdout, update_message=True)
+    )
+    stderr_reader = asyncio.create_task(
+        read_stream(proc.stderr, update_message=False)
+    )
+    monitor = (
+        asyncio.create_task(stall_monitor()) if stall_timeout_s > 0 else None
+    )
+    stderr_output = ""
+
     try:
-        reader = asyncio.create_task(read_stream())
-        monitor = asyncio.create_task(stall_monitor())
-
-        done, pending = await asyncio.wait(
-            {reader, monitor},
-            timeout=turn_timeout_s,
-            return_when=asyncio.FIRST_COMPLETED,
+        await asyncio.wait_for(proc.wait(), timeout=turn_timeout_s)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Codex turn timeout issue={issue.identifier}",
+            extra={"linked_to": issue.identifier},
         )
-
-        if not done:
-            logger.warning(f"Codex turn timeout issue={issue.identifier}", extra={"linked_to": issue.identifier})
-            proc.kill()
-            attempt.status = "timed_out"
-            attempt.error = f"Turn exceeded {turn_timeout_s}s"
-        else:
-            await asyncio.wait_for(proc.wait(), timeout=30)
-
-        for task in pending:
-            task.cancel()
+        attempt.status = "timed_out"
+        attempt.error = f"Turn exceeded {turn_timeout_s}s"
+    except Exception as e:
+        logger.error(
+            f"Codex runner error issue={issue.identifier}: {e}",
+            extra={"linked_to": issue.identifier},
+        )
+        attempt.status = "failed"
+        attempt.error = str(e)
+    finally:
+        if proc.returncode is None:
             try:
-                await task
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Codex process did not exit issue={issue.identifier}",
+                    extra={"linked_to": issue.identifier},
+                )
+
+        if monitor is not None:
+            monitor.cancel()
+            try:
+                await monitor
             except asyncio.CancelledError:
                 pass
 
-    except Exception as e:
-        logger.error(f"Codex runner error issue={issue.identifier}: {e}", extra={"linked_to": issue.identifier})
-        proc.kill()
-        attempt.status = "failed"
-        attempt.error = str(e)
-        # Still need to run after_run hook and unregister PID below
+        stream_results = await asyncio.gather(
+            stdout_reader,
+            stderr_reader,
+            return_exceptions=True,
+        )
+        if isinstance(stream_results[1], str):
+            stderr_output = stream_results[1][-500:]
 
     # Determine final status from exit code if not already set
     if attempt.status == "streaming":
-        stderr_output = ""
-        if proc.stderr:
-            try:
-                stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=5)
-                stderr_output = stderr_bytes.decode()[:500]
-            except (asyncio.TimeoutError, Exception):
-                pass
         if proc.returncode == 0:
             attempt.status = "succeeded"
         else:
@@ -467,6 +517,7 @@ async def run_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
+    reasoning_effort: str | None = None,
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
@@ -475,6 +526,7 @@ async def run_turn(
     if runner_type == "codex":
         return await run_codex_turn(
             model=claude_cfg.model,
+            reasoning_effort=reasoning_effort,
             hooks_cfg=hooks_cfg,
             prompt=prompt,
             workspace_path=workspace_path,

@@ -227,8 +227,9 @@ states:
     type: agent
     prompt: prompts/review.example.md
     linear_state: active
-    runner: claude              # "claude" (default) or "codex"
-    model: claude-opus-4-6
+    runner: codex               # "claude" (default) or "codex"
+    # model: your-codex-model    # optional per-state model override
+    reasoning_effort: high      # minimal, low, medium, high, or xhigh
     max_turns: 10
     session: fresh              # no prior context — adversarial review
     transitions:
