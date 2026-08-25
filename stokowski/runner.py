@@ -91,7 +91,10 @@ def build_codex_args(
             "workspace-write",
             "--cd",
             str(workspace_path.resolve()),
+            "--config",
+            "sandbox_workspace_write.network_access=true",
             "exec",
+            "--ephemeral",
             prompt,
         ]
     )
@@ -113,8 +116,9 @@ async def run_codex_turn(
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
-    This runner uses Codex's non-interactive ``exec`` command. We capture
-    stdout/stderr and use its exit code for status.
+    This runner uses an ephemeral Codex ``exec`` session. It drains stdout and
+    stderr concurrently so progress updates prevent false stall detection while
+    the final stdout message remains available for status reporting.
     """
     args = build_codex_args(model, prompt, workspace_path, reasoning_effort)
 

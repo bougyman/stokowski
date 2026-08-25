@@ -37,7 +37,10 @@ class CodexArgumentTests(unittest.TestCase):
                 "workspace-write",
                 "--cd",
                 "/tmp/example-workspace",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
                 "exec",
+                "--ephemeral",
                 "Investigate the issue",
             ],
         )
@@ -64,7 +67,10 @@ class CodexArgumentTests(unittest.TestCase):
                 "workspace-write",
                 "--cd",
                 "/tmp/example-workspace",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
                 "exec",
+                "--ephemeral",
                 "Review the diff",
             ],
         )
