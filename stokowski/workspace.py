@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class WorkspaceResult:
 async def run_hook(script: str, cwd: Path, timeout_ms: int, label: str) -> bool:
     """Run a shell hook script in the workspace directory. Returns True on success."""
     logger.info(f"hook={label} cwd={cwd}")
+    started_at = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_shell(
             script,
@@ -39,11 +41,26 @@ async def run_hook(script: str, cwd: Path, timeout_ms: int, label: str) -> bool:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_ms / 1000
         )
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        stdout_text = stdout.decode(errors="replace").strip()
+        stderr_text = stderr.decode(errors="replace").strip()
+
+        if stdout_text:
+            logger.debug(f"hook={label} stdout={stdout_text[-2000:]}")
+        if stderr_text:
+            logger.debug(f"hook={label} stderr={stderr_text[-2000:]}")
+
         if proc.returncode != 0:
             logger.error(
-                f"hook={label} failed rc={proc.returncode} stderr={stderr.decode()[:500]}"
+                f"hook={label} failed rc={proc.returncode} "
+                f"elapsed_ms={elapsed_ms} stdout={stdout_text[-500:]} "
+                f"stderr={stderr_text[-500:]}"
             )
             return False
+
+        logger.info(
+            f"hook={label} complete rc=0 elapsed_ms={elapsed_ms}"
+        )
         return True
     except asyncio.TimeoutError:
         logger.error(f"hook={label} timed out after {timeout_ms}ms")

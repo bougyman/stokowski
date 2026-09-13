@@ -138,11 +138,11 @@ Linear issue → isolated git clone → agent (Claude or Codex) → PR + Human R
 
 | Symphony | Stokowski |
 |----------|-----------|
-| `codex app-server` JSON-RPC | `claude -p --output-format stream-json` or `codex --quiet` |
+| `codex app-server` JSON-RPC | `claude -p --output-format stream-json` or `codex exec` |
 | `thread/start` → thread_id | First turn → `session_id` |
 | `turn/start` on thread | `claude -p --resume <session_id>` |
-| `approval_policy: never` | `--dangerously-skip-permissions` |
-| `thread_sandbox` tools | `--allowedTools` list |
+| `approval_policy: never` | Codex `-a never` or Claude `--dangerously-skip-permissions` |
+| `thread_sandbox` tools | Codex `-s workspace-write` or Claude `--allowedTools` list |
 | Elixir/OTP supervision | Python asyncio task pool |
 
 ---
@@ -188,8 +188,8 @@ Stokowski adds a full state machine engine:
 
 Symphony is tightly coupled to Codex via its `app-server` JSON-RPC protocol. Stokowski supports multiple runners and models, configurable per state:
 - **Claude Code** — `claude -p` with stream-json output and multi-turn `--resume`
-- **Codex** — `codex --quiet` for independent second opinions
-- **Per-state model overrides** — use Opus for investigation, Sonnet for implementation, Codex for adversarial review, all in the same pipeline
+- **Codex** — `codex exec` for non-interactive agent turns
+- **Per-state model and reasoning overrides** — select a model for either runner and tune Codex reasoning effort for each phase
 - **Runner-agnostic orchestration** — the state machine, retry logic, and hooks work identically regardless of which runner a state uses
 
 </details>
@@ -245,7 +245,7 @@ Prompt authors never need to write "move the issue to Human Review when done" �
 - **`$VAR` references** — any config value can reference an env var with `$VAR_NAME` syntax
 - **Hot-reload** — `workflow.yaml` is re-parsed on every poll tick; config changes take effect without restart
 - **Per-state concurrency limits** — cap concurrency per state independently of the global limit
-- **Per-state overrides** — model, max_turns, timeouts, hooks, session mode, and permission mode can all be overridden per state
+- **Per-state overrides** — model, Codex reasoning effort, max_turns, timeouts, hooks, session mode, and permission mode can all be overridden per state
 
 </details>
 
@@ -399,6 +399,13 @@ https://linear.app/your-team/project/my-project-abc123def456
                                               this part, not the name
 ```
 
+**`tracker.assignee`** *(optional)* — set this to `me` to process only issues
+assigned to the user authenticated by that tracker's API key. Stokowski applies
+the scope to dispatch, retries, gate/rework handling, and reconciliation. If a
+running issue is reassigned away, its agent stops on the next poll. Omit the
+field to keep the default project-wide behavior. `me` is currently the only
+supported value.
+
 **`hooks.after_create`** — how to clone your repo into a fresh workspace:
 
 ```yaml
@@ -501,6 +508,7 @@ projects:
       kind: linear
       project_slug: "abc123def456"
       api_key: "$LINEAR_API_KEY"
+      assignee: me                   # optional: only this API user's issues
     workspace:
       root: ~/.local/share/stokowski/workspaces/synced-sport
     hooks:
@@ -553,6 +561,7 @@ tracker:
   kind: linear                          # only "linear" supported
   project_slug: "abc123def456"          # hex slugId from your Linear project URL
   api_key: "lin_api_your_key_here"      # your Linear API key — agents inherit this
+  assignee: me                           # optional: only this API user's issues
 
 # These map Stokowski's internal lifecycle roles to your Linear state names.
 # You can rename values to match your team's Linear setup (e.g. todo: "Ready"),
@@ -658,6 +667,7 @@ states:                                # the state machine pipeline
     prompt: prompts/code-review.md
     linear_state: active
     runner: codex                      # use Codex for an independent review
+    reasoning_effort: high             # minimal, low, medium, high, or xhigh
     session: fresh                     # fresh session — no prior context
     transitions:
       complete: review_merge
@@ -689,7 +699,8 @@ Each state can override these fields from the root `claude` / `hooks` defaults. 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `runner` | `claude` | `claude` (Claude Code CLI) or `codex` (Codex CLI) |
-| `model` | root `claude.model` | Model override for this state |
+| `model` | runner default | Model override for this state; Codex states do not inherit a root Claude model |
+| `reasoning_effort` | Codex default | Codex-only reasoning override: `minimal`, `low`, `medium`, `high`, or `xhigh` |
 | `max_turns` | root `claude.max_turns` | Max turns for this state |
 | `turn_timeout_ms` | root value | Per-turn timeout |
 | `stall_timeout_ms` | root value | Stall detection timeout |
@@ -859,7 +870,8 @@ prompts/       →  Jinja2 stage prompt files
     Agent Runner (per-state configurable)
     ├── Claude Code: claude -p --output-format stream-json
     │   └── --resume <session_id>  (multi-turn continuity)
-    ├── Codex: codex --quiet --prompt
+    ├── Codex: codex exec --json
+    │   └── JSONL events drive live activity, messages, token usage, and stalls
     ├── stall detection + turn timeout
     └── PID tracking for clean shutdown
           │
@@ -924,7 +936,8 @@ git diff HEAD@{1} workflow.example.yaml
 
 ## Security
 
-- **`permission_mode: auto`** passes `--dangerously-skip-permissions` to Claude Code. Agents can execute arbitrary commands in the workspace. Only use in trusted environments or Docker containers. (Codex runs with `--quiet` which auto-approves.)
+- **`permission_mode: auto`** passes `--dangerously-skip-permissions` to Claude Code. Agents can execute arbitrary commands in the workspace. Only use in trusted environments or Docker containers.
+- Codex turns use approval policy `never` with the `workspace-write` sandbox, so denied operations fail instead of waiting for interactive approval.
 - **`permission_mode: allowedTools`** scopes Claude Code to a specific tool list — safer for production.
 - API keys live in `workflow.yaml`, which is gitignored. They are passed to agent subprocesses as env vars automatically.
 - Each agent only has access to its own isolated workspace directory.
