@@ -859,7 +859,8 @@ prompts/       →  Jinja2 stage prompt files
     Agent Runner (per-state configurable)
     ├── Claude Code: claude -p --output-format stream-json
     │   └── --resume <session_id>  (multi-turn continuity)
-    ├── Codex: codex --quiet --prompt
+    ├── Codex: codex exec --json
+    │   └── JSONL events drive live activity, messages, and token usage
     ├── stall detection + turn timeout
     └── PID tracking for clean shutdown
           │

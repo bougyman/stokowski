@@ -1,0 +1,192 @@
+import asyncio
+import os
+import sys
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from stokowski.config import HooksConfig
+from stokowski.models import Issue, RunAttempt
+from stokowski.runner import build_codex_args, run_codex_turn
+
+
+class CodexArgumentTests(unittest.TestCase):
+    def test_builds_json_automation_command(self):
+        args = build_codex_args(
+            model="example-model",
+            prompt="Investigate the issue",
+            workspace_path=Path("/tmp/example-workspace"),
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "codex",
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "--ephemeral",
+                "--json",
+                "--cd",
+                "/tmp/example-workspace",
+                "--config",
+                'approval_policy="never"',
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+                "--model",
+                "example-model",
+                "Investigate the issue",
+            ],
+        )
+
+
+class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def attempt(self):
+        return RunAttempt(issue_id="issue-1", issue_identifier="SYN-1")
+
+    def issue(self):
+        return Issue(id="issue-1", identifier="SYN-1", title="Example")
+
+    @patch("stokowski.runner.build_codex_args")
+    async def test_parses_and_logs_json_events(self, build_args):
+        events = [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item-1",
+                    "type": "command_execution",
+                    "command": "git status --short",
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item-2",
+                    "type": "agent_message",
+                    "text": "Investigation complete",
+                },
+            },
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        ]
+        script = (
+            "import json\n"
+            f"events = {events!r}\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n"
+        )
+        build_args.return_value = [sys.executable, "-c", script]
+        forwarded_events = []
+
+        with TemporaryDirectory() as directory:
+            with self.assertLogs("stokowski.runner", level="INFO") as logs:
+                attempt = await run_codex_turn(
+                    model=None,
+                    hooks_cfg=HooksConfig(),
+                    prompt="Investigate",
+                    workspace_path=Path(directory),
+                    issue=self.issue(),
+                    attempt=self.attempt(),
+                    on_event=lambda *event: forwarded_events.append(event),
+                    turn_timeout_ms=2_000,
+                    stall_timeout_ms=500,
+                )
+
+        self.assertEqual(attempt.status, "succeeded")
+        self.assertIsNone(attempt.session_id)
+        self.assertEqual(attempt.last_event, "turn.completed")
+        self.assertEqual(
+            attempt.last_message,
+            "agent message completed: Investigation complete",
+        )
+        self.assertEqual(attempt.input_tokens, 10)
+        self.assertEqual(attempt.output_tokens, 2)
+        self.assertEqual(attempt.total_tokens, 12)
+        self.assertEqual(len(forwarded_events), len(events))
+
+        output = "\n".join(logs.output)
+        self.assertIn("Codex started issue=SYN-1", output)
+        self.assertIn("command started: git status --short", output)
+        self.assertIn("turn completed tokens=12", output)
+
+    @patch("stokowski.runner.build_codex_args")
+    async def test_stderr_activity_is_drained_and_logged(self, build_args):
+        script = (
+            "import json, sys, time\n"
+            "for _ in range(5):\n"
+            "    print('waiting for service', file=sys.stderr, flush=True)\n"
+            "    time.sleep(0.04)\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n"
+        )
+        build_args.return_value = [sys.executable, "-c", script]
+
+        with TemporaryDirectory() as directory:
+            with self.assertLogs("stokowski.runner", level="INFO") as logs:
+                attempt = await run_codex_turn(
+                    model=None,
+                    hooks_cfg=HooksConfig(),
+                    prompt="Investigate",
+                    workspace_path=Path(directory),
+                    issue=self.issue(),
+                    attempt=self.attempt(),
+                    turn_timeout_ms=2_000,
+                    stall_timeout_ms=100,
+                )
+
+        self.assertEqual(attempt.status, "succeeded")
+        self.assertIn("stderr: waiting for service", "\n".join(logs.output))
+
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX-specific")
+    @patch("stokowski.runner.build_codex_args")
+    async def test_stall_kills_the_entire_process_group(self, build_args):
+        pid_events = []
+
+        with TemporaryDirectory() as directory:
+            child_pid_path = Path(directory) / "child.pid"
+            script = (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen("
+                "[sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                f"open({str(child_pid_path)!r}, 'w').write(str(child.pid))\n"
+                "time.sleep(30)\n"
+            )
+            build_args.return_value = [sys.executable, "-c", script]
+
+            attempt = await run_codex_turn(
+                model=None,
+                hooks_cfg=HooksConfig(),
+                prompt="Investigate",
+                workspace_path=Path(directory),
+                issue=self.issue(),
+                attempt=self.attempt(),
+                on_pid=lambda *event: pid_events.append(event),
+                turn_timeout_ms=2_000,
+                stall_timeout_ms=100,
+            )
+            child_pid = int(child_pid_path.read_text())
+
+            for _ in range(20):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                os.kill(child_pid, 9)
+                self.fail("Codex descendant remained alive after stall handling")
+
+        self.assertEqual(attempt.status, "stalled")
+        self.assertTrue(attempt.error.startswith("No output for"))
+        self.assertEqual(len(pid_events), 2)
+        self.assertTrue(pid_events[0][1])
+        self.assertFalse(pid_events[1][1])
+
+
+if __name__ == "__main__":
+    unittest.main()

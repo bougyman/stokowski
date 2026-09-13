@@ -6,6 +6,10 @@ All notable changes to Stokowski are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Stream readable Codex JSONL activity into the terminal and dashboard, drain diagnostic stderr concurrently, report hook completion and captured output, and kill the complete Codex process group after stalls or timeouts.
+
 ---
 
 ## [0.5.0] - 2026-06-23
