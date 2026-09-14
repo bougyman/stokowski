@@ -116,15 +116,23 @@ def _process_codex_event(
     summary = event_type
 
     if event_type == "thread.started":
-        # Codex runs are ephemeral, so this ID is useful activity telemetry but
-        # must not be persisted as a resumable Claude session ID.
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            attempt.session_id = thread_id
+            attempt.session_started = True
         summary = "thread started"
     elif event_type.startswith("item."):
         item = event.get("item", {})
         if isinstance(item, dict):
             summary = _codex_item_summary(event_type, item)
             attempt.last_message = summary[:200]
+            if event_type == "item.completed" and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    attempt.result_text = text.strip()
     elif event_type == "turn.started":
+        if attempt.session_id:
+            attempt.session_started = True
         summary = "turn started"
         attempt.last_message = summary
     elif event_type == "turn.completed":
@@ -207,27 +215,28 @@ def build_codex_args(
     prompt: str,
     workspace_path: Path,
     effort: str | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
-    """Build a non-interactive Codex JSONL invocation."""
+    """Build a persistent non-interactive Codex JSONL invocation."""
     if effort is not None and effort not in SUPPORTED_EFFORTS:
         raise ValueError(f"Unsupported Codex effort: {effort!r}")
 
-    args = [
-        "codex",
-        "exec",
-        "--sandbox",
-        "danger-full-access",
-        "--ephemeral",
+    args = ["codex", "exec"]
+    if session_id:
+        args.append("resume")
+
+    args.extend([
+        "--dangerously-bypass-approvals-and-sandbox",
         "--json",
-        "--cd",
-        str(workspace_path),
-        "--config",
-        'approval_policy="never"',
-    ]
+    ])
+    if not session_id:
+        args.extend(["--cd", str(workspace_path)])
     if model:
         args.extend(["--model", model])
     if effort:
         args.extend(["--config", f'model_reasoning_effort="{effort}"'])
+    if session_id:
+        args.append(session_id)
     args.append(prompt)
     return args
 
@@ -248,10 +257,20 @@ async def run_codex_turn(
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
-    Codex sessions are ephemeral here, so each state gets a fresh run. JSONL
-    output keeps the activity monitor updated during long-running turns.
+    Codex emits a durable thread ID in JSONL.  Supplying it to a later call
+    resumes that native thread; JSONL also keeps the activity monitor updated
+    during long-running turns.
     """
-    args = build_codex_args(model, prompt, workspace_path, effort)
+    args = build_codex_args(
+        model, prompt, workspace_path, effort, attempt.session_id
+    )
+
+    logger.info(
+        f"Launching codex issue={issue.identifier} "
+        f"session={attempt.session_id or 'new'} "
+        f"turn={attempt.turn_count + 1}",
+        extra={"linked_to": issue.identifier},
+    )
 
     # Run before_run hook
     if hooks_cfg.before_run:
@@ -281,6 +300,7 @@ async def run_codex_turn(
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
             env=env,
         )
+        attempt.process_started = True
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
         logger.info(
@@ -518,6 +538,7 @@ async def run_agent_turn(
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
             env=env,
         )
+        attempt.process_started = True
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
     except FileNotFoundError:

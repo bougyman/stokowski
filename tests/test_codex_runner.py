@@ -39,14 +39,10 @@ class CodexArgumentTests(unittest.TestCase):
             [
                 "codex",
                 "exec",
-                "--sandbox",
-                "danger-full-access",
-                "--ephemeral",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--json",
                 "--cd",
                 "/tmp/example-workspace",
-                "--config",
-                'approval_policy="never"',
                 "Investigate the issue",
             ],
         )
@@ -64,19 +60,41 @@ class CodexArgumentTests(unittest.TestCase):
             [
                 "codex",
                 "exec",
-                "--sandbox",
-                "danger-full-access",
-                "--ephemeral",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--json",
                 "--cd",
                 "/tmp/example-workspace",
-                "--config",
-                'approval_policy="never"',
                 "--model",
                 "example-codex-model",
                 "--config",
                 'model_reasoning_effort="max"',
                 "Review the diff",
+            ],
+        )
+
+    def test_resumes_a_persisted_thread_with_new_model_and_effort(self):
+        args = build_codex_args(
+            model="gpt-5.6-luna",
+            prompt="Implement the plan",
+            workspace_path=Path("/tmp/example-workspace"),
+            effort="max",
+            session_id="0199d04e-thread",
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "codex",
+                "exec",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--json",
+                "--model",
+                "gpt-5.6-luna",
+                "--config",
+                'model_reasoning_effort="max"',
+                "0199d04e-thread",
+                "Implement the plan",
             ],
         )
 
@@ -108,6 +126,25 @@ class ClaudeEffortArgumentTests(unittest.TestCase):
                 prompt="Review the diff",
                 workspace_path=Path("/tmp/example-workspace"),
             )
+
+    def test_resume_can_change_model_and_effort(self):
+        args = build_claude_args(
+            ClaudeConfig(model="claude-sonnet-5", effort="max"),
+            prompt="Implement the plan",
+            workspace_path=Path("/tmp/example-workspace"),
+            session_id="claude-session-1",
+        )
+
+        self.assertEqual(args[:4], ["claude", "-p", "Implement the plan", "--resume"])
+        self.assertIn("claude-session-1", args)
+        self.assertEqual(
+            args[args.index("--model") : args.index("--model") + 2],
+            ["--model", "claude-sonnet-5"],
+        )
+        self.assertEqual(
+            args[args.index("--effort") : args.index("--effort") + 2],
+            ["--effort", "max"],
+        )
 
 
 class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -216,6 +253,24 @@ states:
         self.assertIn(
             "project 'example' state 'work': unsupported effort: 'extreme' "
             "(valid: low, medium, high, xhigh, max)",
+            errors,
+        )
+
+    def test_validation_rejects_unknown_session_mode(self):
+        errors = validate_config(
+            self.service_config(
+                StateConfig(
+                    name="work",
+                    prompt="test_codex_runner.py",
+                    session="sideways",
+                    transitions={"complete": "done"},
+                )
+            )
+        )
+
+        self.assertIn(
+            "project 'example' state 'work': unsupported session mode: "
+            "'sideways' (valid: inherit, handoff, fresh)",
             errors,
         )
 

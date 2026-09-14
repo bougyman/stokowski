@@ -65,6 +65,11 @@ class RunAttempt:
     started_at: datetime | None = None
     status: str = "pending"
     session_id: str | None = None
+    runner_type: str = "claude"
+    session_mode: str = "inherit"
+    resumed_session_id: str | None = None
+    process_started: bool = False
+    session_started: bool = False
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0

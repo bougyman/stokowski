@@ -73,6 +73,7 @@ def test_real_capture_sees_the_tool_call(real_turn):
 
 def test_real_capture_takes_session_id_from_init_not_result(real_turn):
     assert real_turn.session_id == "ffae5c82-d0d2-4fb8-8a95-0dcdd7378403"
+    assert real_turn.session_started is True
     assert real_turn.model == "claude-sonnet-4-6"
 
 

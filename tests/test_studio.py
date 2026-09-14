@@ -273,7 +273,9 @@ def test_describe_reports_the_pipeline(studio):
 
 def test_describe_advertises_what_is_editable(studio):
     d = studio.describe()
-    assert d["state_fields"]["session"]["choices"] == ["inherit", "fresh"]
+    assert d["state_fields"]["session"]["choices"] == [
+        "inherit", "handoff", "fresh"
+    ]
     assert d["root_fields"]["polling.interval_ms"]["type"] == "int"
     assert "tracker.api_key" not in d["root_fields"]
 
