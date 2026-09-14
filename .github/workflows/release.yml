@@ -19,13 +19,49 @@ jobs:
         id: check
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%s)
-          if [[ "$COMMIT_MSG" =~ ^Release\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-            echo "version=v${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
+          echo "Head commit: $COMMIT_MSG"
+
+          # Three subjects have occurred in practice, and each one shipped a
+          # release that silently did not happen:
+          #
+          #   Release v1.1.0 (#47)                                  squash
+          #   Merge pull request #44 from Sugar-Coffee/release/v1.0.0  merge
+          #   Release v1.0.0                                        bare / rebase
+          #
+          # GitHub appends " (#N)" to the PR title on squash — the form the
+          # release doc claimed produced a bare subject, and the reason v1.1.0
+          # had to be tagged by hand even after the merge-commit form was fixed.
+          VERSION=""
+          SEMVER='([0-9]+\.[0-9]+\.[0-9]+)'
+          SUFFIX='( \(#[0-9]+\))?'
+          if [[ "$COMMIT_MSG" =~ ^Release\ v${SEMVER}${SUFFIX}$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$COMMIT_MSG" =~ ^Merge\ pull\ request\ #[0-9]+\ from\ .*/release/v${SEMVER}${SUFFIX}$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+          fi
+
+          if [ -z "$VERSION" ]; then
             echo "is_release=false" >> "$GITHUB_OUTPUT"
             echo "Not a release commit, skipping."
+            exit 0
           fi
+
+          # Cross-check against pyproject so a mislabelled merge cannot tag a
+          # version the package does not claim to be.
+          PKG_VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Commit says v${VERSION} but pyproject.toml says ${PKG_VERSION}."
+            exit 1
+          fi
+
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists."
+            exit 1
+          fi
+
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing v${VERSION}"
 
       - name: Fetch release PR body
         id: pr

@@ -26,7 +26,9 @@ mechanical stage — no new code changes.
    ```
    gh pr merge <number> --squash --delete-branch
    ```
-5. Update the Linear workpad with the merge confirmation.
+5. Write `.stokowski/report.json` confirming the merge: the PR number, the
+   merge commit, and the CI result. Set `verdict` to `complete`, or `blocked`
+   with what stopped you. Stokowski posts it.
 6. Move the Linear issue to `Done`.
 
 ## Rework run
@@ -43,7 +45,7 @@ If this is a rework run (merge was attempted before but failed):
    - If it is a test failure caused by the PR's changes, post details to
      Linear and stop (this needs to go back to implementation).
    - If it is a flaky or infrastructure issue, re-run and retry the merge.
-4. Update the workpad with what happened.
+4. Write `.stokowski/report.json` describing what happened and what fixed it.
 
 ## Do NOT
 

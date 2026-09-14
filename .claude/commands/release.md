@@ -141,6 +141,21 @@ gh pr create \
 
 Tell the user: "Release PR opened: <PR URL>"
 
-> **⚠️ Important: Squash-merge only**
+> **Merging**
 >
-> You must squash-merge this PR (not a regular merge). The GitHub Action detects releases by reading the merge commit message, which must be exactly `Release vX.Y.Z`. GitHub sets this automatically from the PR title when squash-merging.
+> Either merge style works. The Action recognises all three subjects this repo
+> has produced:
+>
+> - `Release vX.Y.Z (#N)` — squash merge (GitHub appends the PR number)
+> - `Merge pull request #N from <owner>/release/vX.Y.Z` — regular merge
+> - `Release vX.Y.Z` — bare
+>
+> It did not always, and both v1.0.0 and v1.1.0 shipped untagged as a result —
+> the Action found no match, logged "not a release commit" and reported success.
+> Both tags had to be created by hand.
+>
+> The branch must be named `release/vX.Y.Z` and the version must match
+> `pyproject.toml`, or the Action fails loudly rather than skipping in silence.
+>
+> **After merging, check that the tag exists.** `gh release list` takes a second
+> and this has now gone wrong twice.

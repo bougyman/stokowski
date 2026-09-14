@@ -99,6 +99,9 @@ query($issueId: String!) {
         id
         body
         createdAt
+        user { name displayName }
+        botActor { name }
+        externalUser { name }
       }
     }
   }
@@ -110,6 +113,48 @@ mutation($issueId: String!, $stateId: String!) {
   issueUpdate(id: $issueId, input: { stateId: $stateId }) {
     success
     issue { id state { name } }
+  }
+}
+"""
+
+FILE_UPLOAD_MUTATION = """
+mutation($contentType: String!, $filename: String!, $size: Int!) {
+  fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+    success
+    uploadFile {
+      uploadUrl
+      assetUrl
+      headers { key value }
+    }
+  }
+}
+"""
+
+TEAM_LABELS_QUERY = """
+query($issueId: String!) {
+  issue(id: $issueId) {
+    team {
+      id
+      labels(first: 250) { nodes { id name } }
+    }
+    labels { nodes { id name } }
+  }
+}
+"""
+
+LABEL_CREATE_MUTATION = """
+mutation($teamId: String!, $name: String!, $color: String) {
+  issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
+    success
+    issueLabel { id name }
+  }
+}
+"""
+
+ISSUE_ADD_LABEL_MUTATION = """
+mutation($issueId: String!, $labelId: String!) {
+  issueAddLabel(id: $issueId, labelId: $labelId) {
+    success
   }
 }
 """
@@ -351,14 +396,128 @@ class LinearClient:
             return False
 
     async def fetch_comments(self, issue_id: str) -> list[dict]:
-        """Fetch all comments on a Linear issue. Returns list of {id, body, createdAt}."""
+        """Fetch all comments on a Linear issue, OLDEST FIRST.
+
+        `orderBy: createdAt` sorts *descending* in Linear's API — newest first.
+        Every consumer here (`parse_latest_tracking`, `get_last_tracking_timestamp`,
+        the prompt's review-comment section) is written against oldest-first and
+        keeps the last match it sees, so the raw order silently yields the
+        *first* tracking entry an issue ever had instead of its current one.
+        That made gate approve/rework a no-op after any restart. Sort here so
+        the contract holds for every caller.
+        """
         try:
             data = await self._graphql(COMMENTS_QUERY, {"issueId": issue_id})
             issue = data.get("issue", {})
-            return issue.get("comments", {}).get("nodes", [])
+            nodes = issue.get("comments", {}).get("nodes", [])
+            return sorted(nodes, key=lambda c: c.get("createdAt") or "")
         except Exception as e:
             logger.error(f"Failed to fetch comments for {issue_id}: {e}")
             return []
+
+    async def upload_file(
+        self, filename: str, content_type: str, data: bytes
+    ) -> str | None:
+        """Upload a file to Linear's asset store. Returns the asset URL.
+
+        Two steps: ask Linear for a pre-signed destination, then PUT the bytes
+        there with the headers it hands back. The returned `assetUrl` is what
+        goes in markdown; `uploadUrl` is single-use and must not be shared.
+        """
+        try:
+            data_out = await self._graphql(
+                FILE_UPLOAD_MUTATION,
+                {
+                    "contentType": content_type,
+                    "filename": filename,
+                    "size": len(data),
+                },
+            )
+        except Exception as e:
+            logger.error(f"fileUpload request failed for {filename}: {e}")
+            return None
+
+        payload = (data_out or {}).get("fileUpload") or {}
+        if not payload.get("success"):
+            logger.error(f"Linear declined upload slot for {filename}")
+            return None
+
+        upload_file = payload.get("uploadFile") or {}
+        upload_url = upload_file.get("uploadUrl")
+        asset_url = upload_file.get("assetUrl")
+        if not upload_url or not asset_url:
+            logger.error(f"Linear returned no upload URL for {filename}")
+            return None
+
+        headers = {"Content-Type": content_type}
+        for header in upload_file.get("headers") or []:
+            key, value = header.get("key"), header.get("value")
+            if key and value is not None:
+                headers[key] = value
+
+        try:
+            # Deliberately not self._client: that carries the Linear auth header,
+            # which the storage backend rejects.
+            async with httpx.AsyncClient(timeout=self.timeout * 4) as uploader:
+                resp = await uploader.put(upload_url, content=data, headers=headers)
+                resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Upload of {filename} to asset store failed: {e}")
+            return None
+
+        logger.info(f"Uploaded artifact {filename} ({len(data):,} bytes)")
+        return asset_url
+
+    async def fetch_team_labels(self, issue_id: str) -> tuple[str | None, dict[str, str], set[str]]:
+        """Return (team_id, {lowercased label name: id}, {ids already on issue})."""
+        try:
+            data = await self._graphql(TEAM_LABELS_QUERY, {"issueId": issue_id})
+        except Exception as e:
+            logger.error(f"Failed to fetch labels for {issue_id}: {e}")
+            return None, {}, set()
+
+        issue = (data or {}).get("issue") or {}
+        team = issue.get("team") or {}
+        labels = {
+            node["name"].strip().lower(): node["id"]
+            for node in (team.get("labels") or {}).get("nodes", [])
+            if node.get("name") and node.get("id")
+        }
+        existing = {
+            node["id"]
+            for node in (issue.get("labels") or {}).get("nodes", [])
+            if node.get("id")
+        }
+        return team.get("id"), labels, existing
+
+    async def create_label(
+        self, team_id: str, name: str, color: str | None = None
+    ) -> str | None:
+        """Create a team label. Returns its id, or None if creation failed."""
+        try:
+            data = await self._graphql(
+                LABEL_CREATE_MUTATION,
+                {"teamId": team_id, "name": name, "color": color},
+            )
+        except Exception as e:
+            logger.error(f"Failed to create label '{name}': {e}")
+            return None
+        payload = (data or {}).get("issueLabelCreate") or {}
+        if not payload.get("success"):
+            return None
+        return (payload.get("issueLabel") or {}).get("id")
+
+    async def add_label(self, issue_id: str, label_id: str) -> bool:
+        """Attach an existing label to an issue."""
+        try:
+            data = await self._graphql(
+                ISSUE_ADD_LABEL_MUTATION,
+                {"issueId": issue_id, "labelId": label_id},
+            )
+            return (data or {}).get("issueAddLabel", {}).get("success", False)
+        except Exception as e:
+            logger.error(f"Failed to add label to {issue_id}: {e}")
+            return False
 
     async def update_issue_state(self, issue_id: str, state_name: str) -> bool:
         """Move an issue to a new state by name. Returns True on success."""
