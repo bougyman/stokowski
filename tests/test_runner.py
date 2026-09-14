@@ -24,14 +24,10 @@ class CodexArgumentTests(unittest.TestCase):
             [
                 "codex",
                 "exec",
-                "--sandbox",
-                "danger-full-access",
-                "--ephemeral",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--json",
                 "--cd",
                 "/tmp/example-workspace",
-                "--config",
-                'approval_policy="never"',
                 "--model",
                 "example-model",
                 "Investigate the issue",
@@ -130,7 +126,9 @@ class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(attempt.status, "succeeded")
-        self.assertIsNone(attempt.session_id)
+        self.assertEqual(attempt.session_id, "thread-1")
+        self.assertTrue(attempt.session_started)
+        self.assertEqual(attempt.result_text, "Investigation complete")
         self.assertEqual(attempt.last_event, "turn.completed")
         self.assertEqual(
             attempt.last_message,

@@ -32,6 +32,7 @@ from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
 from . import artifacts as artifacts_mod
+from . import continuity as continuity_mod
 from . import report as report_mod
 from .events import summarise_tool_input
 from .ledger import Ledger
@@ -95,7 +96,6 @@ class Orchestrator:
         self._tasks: dict[str, asyncio.Task] = {}
         self._retry_timers: dict[str, asyncio.TimerHandle] = {}
         self._child_pids: set[int] = set()  # Track claude subprocess PIDs
-        self._last_session_ids: dict[str, str] = {}  # issue_id -> last known session_id
         self._jinja = Environment(undefined=StrictUndefined)
         self._running = False
         self._last_issues: dict[str, Issue] = {}
@@ -617,7 +617,6 @@ class Orchestrator:
             self._issue_state_runs.pop(issue.id, None)
             self._announced_states = {k for k in self._announced_states if k[0] != issue.id}
             self._pending_gates.pop(issue.id, None)
-            self._last_session_ids.pop(issue.id, None)
             self.claimed.discard(issue.id)
             self.completed.add(issue.id)
 
@@ -848,7 +847,6 @@ class Orchestrator:
                 self._issue_current_state.pop(issue_id, None)
                 self._issue_state_runs.pop(issue_id, None)
                 self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
-                self._last_session_ids.pop(issue_id, None)
                 self.claimed.discard(issue_id)
                 ident = self._last_issues.get(
                     issue_id, Issue(id="", identifier=issue_id, title="")
@@ -1111,20 +1109,9 @@ class Orchestrator:
             issue_identifier=issue.identifier,
             attempt=attempt_num,
             state_name=state_name,
+            runner_type=state_cfg.runner if state_cfg else "claude",
+            session_mode=state_cfg.session if state_cfg else "inherit",
         )
-
-        # Session handling
-        use_fresh_session = False
-        if state_cfg and state_cfg.session == "fresh":
-            use_fresh_session = True
-
-        if not use_fresh_session:
-            if issue.id in self.running:
-                old = self.running[issue.id]
-                if old.session_id:
-                    attempt.session_id = old.session_id
-            elif issue.id in self._last_session_ids:
-                attempt.session_id = self._last_session_ids[issue.id]
 
         self.running[issue.id] = attempt
         task = asyncio.create_task(self._run_worker(issue, attempt))
@@ -1136,7 +1123,7 @@ class Orchestrator:
             f"state={issue.state} "
             f"machine_state={state_name or 'entry'} "
             f"runner={runner} "
-            f"session={'fresh' if use_fresh_session else 'inherit'} "
+            f"session={attempt.session_mode} "
             f"attempt={attempt_num}",
             extra={"linked_to": issue.identifier},
         )
@@ -1167,6 +1154,10 @@ class Orchestrator:
                 )
                 runner_type = state_cfg.runner
 
+            attempt.runner_type = runner_type
+            attempt.session_mode = state_cfg.session if state_cfg else "inherit"
+            attempt.model = claude_cfg.model
+
             ws_root = self.cfg.workspace.resolved_root()
             ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
@@ -1177,6 +1168,19 @@ class Orchestrator:
             # A stale report from a previous stage would otherwise be re-posted
             # verbatim as if it described this one.
             report_mod.discard(ws.path)
+
+            resume = continuity_mod.prepare(
+                ws.path, runner_type, attempt.session_mode
+            )
+            attempt.session_id = resume.session_id
+            attempt.resumed_session_id = resume.session_id
+            logger.info(
+                f"Continuity issue={issue.identifier} runner={runner_type} "
+                f"mode={attempt.session_mode} "
+                f"native={'resume' if resume.session_id else 'new'} "
+                f"handoff={'yes' if resume.handoff else 'no'}",
+                extra={"linked_to": issue.identifier},
+            )
 
             # Move issue from Todo to In Progress if needed
             todo_state = self.cfg.linear_states.todo
@@ -1222,6 +1226,7 @@ class Orchestrator:
                     return
 
             prompt = await self._render_prompt_async(issue, attempt.attempt, state_name)
+            prompt = continuity_mod.append_handoff(prompt, resume.handoff)
 
             # Build env vars for the agent subprocess from workflow.yaml config
             agent_env = self.cfg.agent_env()
@@ -1229,6 +1234,27 @@ class Orchestrator:
             agent_env["STOKOWSKI_ISSUE"] = issue.identifier
             if state_name:
                 agent_env["STOKOWSKI_STATE"] = state_name
+
+            persisted_session_id: str | None = None
+
+            def on_worker_event(
+                identifier: str, event_type: str, event: dict
+            ) -> None:
+                nonlocal persisted_session_id
+                self._on_agent_event(identifier, event_type, event)
+                if (
+                    attempt.session_started
+                    and attempt.session_id
+                    and attempt.session_id != persisted_session_id
+                ):
+                    continuity_mod.save_session(
+                        ws.path,
+                        runner_type,
+                        attempt.session_id,
+                        attempt.model,
+                        resume.seen_sequence,
+                    )
+                    persisted_session_id = attempt.session_id
 
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
@@ -1244,7 +1270,7 @@ class Orchestrator:
                     workspace_path=ws.path,
                     issue=issue,
                     attempt=attempt,
-                    on_event=self._on_agent_event,
+                    on_event=on_worker_event,
                     on_pid=self._on_child_pid,
                     env=agent_env,
                 )
@@ -1300,13 +1326,22 @@ class Orchestrator:
                         workspace_path=ws.path,
                         issue=issue,
                         attempt=attempt,
-                        on_event=self._on_agent_event,
+                        on_event=on_worker_event,
                         on_pid=self._on_child_pid,
                         env=agent_env,
                     )
 
                     if attempt.status != "succeeded":
                         break
+
+            try:
+                continuity_report = report_mod.load(ws.path, attempt.result_text)
+                continuity_mod.complete(ws.path, attempt, continuity_report)
+            except Exception as e:
+                logger.warning(
+                    f"Could not persist continuity for {issue.identifier}: {e}",
+                    extra={"linked_to": issue.identifier},
+                )
 
             await self._publish_run_report(issue, attempt, ws.path, state_name)
 
@@ -1656,9 +1691,6 @@ class Orchestrator:
             elapsed = (datetime.now(timezone.utc) - attempt.started_at).total_seconds()
             self.total_seconds_running += elapsed
 
-        if attempt.session_id:
-            self._last_session_ids[issue.id] = attempt.session_id
-
         completed_at = datetime.now(timezone.utc)
         attempt.completed_at = completed_at
         if attempt.status != "canceled":
@@ -1858,8 +1890,6 @@ class Orchestrator:
                 self._issue_state_runs.pop(issue_id, None)
                 self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
                 self._pending_gates.pop(issue_id, None)
-                self._last_session_ids.pop(issue_id, None)
-
             elif state_lower == review_lower:
                 # In review/gate state — stop worker but keep gate tracking
                 task = self._tasks.get(issue_id)
@@ -1922,6 +1952,8 @@ class Orchestrator:
                     "issue_id": r.issue_id,
                     "issue_identifier": r.issue_identifier,
                     "session_id": r.session_id,
+                    "runner": r.runner_type,
+                    "session_mode": r.session_mode,
                     "turn_count": r.turn_count,
                     "status": r.status,
                     "last_event": r.last_event,

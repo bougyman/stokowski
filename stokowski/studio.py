@@ -35,7 +35,7 @@ from typing import Any
 
 from ruamel.yaml import YAML
 
-from .config import parse_workflow_file, validate_config
+from .config import SESSION_MODES, parse_workflow_file, validate_config
 from .model_catalogue import EFFORT_LEVELS, catalogue
 
 logger = logging.getLogger("stokowski.studio")
@@ -79,7 +79,7 @@ ROOT_FIELDS: dict[str, tuple[str, list[str] | None]] = {
 STATE_FIELDS: dict[str, tuple[str, list[str] | None]] = {
     "model": _MODEL,
     "effort": _EFFORT,
-    "session": ("str", ["inherit", "fresh"]),
+    "session": ("str", list(SESSION_MODES)),
     "runner": ("str", ["claude", "codex"]),
     "prompt": _STR,
     "max_rework": _INT,

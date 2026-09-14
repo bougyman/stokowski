@@ -189,6 +189,7 @@ def _handle_system(event: dict, attempt: RunAttempt) -> None:
         session_id = event.get("session_id")
         if session_id:
             attempt.session_id = session_id
+            attempt.session_started = True
         model = event.get("model")
         if isinstance(model, str):
             attempt.model = model

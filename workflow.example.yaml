@@ -245,6 +245,11 @@ routing:
 #   - Human approves a gate        → "approve" transition
 #   - Human requests rework        → rework_to target
 #
+# Session modes:
+#   - inherit  → resume this runner's native session and add unseen handoffs
+#   - handoff  → start a new native session with bounded prior outcomes
+#   - fresh    → start a new native session with no prior agent outcome
+#
 states:
 
   # ── 1. Investigate ──────────────────────────────────────────────────────

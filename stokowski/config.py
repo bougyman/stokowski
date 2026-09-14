@@ -16,6 +16,7 @@ logger = logging.getLogger("stokowski.config")
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 SUPPORTED_EFFORTS = frozenset(EFFORT_LEVELS)
+SESSION_MODES = ("inherit", "handoff", "fresh")
 
 
 @dataclass
@@ -1011,6 +1012,11 @@ def _validate_states(
                 errors.append(
                     f"{prefix} state '{name}': unsupported effort: {sc.effort!r} "
                     f"(valid: {', '.join(EFFORT_LEVELS)})"
+                )
+            if sc.session not in SESSION_MODES:
+                errors.append(
+                    f"{prefix} state '{name}': unsupported session mode: "
+                    f"{sc.session!r} (valid: {', '.join(SESSION_MODES)})"
                 )
 
         elif sc.type == "gate":

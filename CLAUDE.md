@@ -12,7 +12,7 @@ Stokowski is a long-running Python daemon that:
 1. Polls Linear for issues in configured active states
 2. Creates an isolated git-cloned workspace per issue
 3. Launches the configured agent (`claude -p` or `codex exec`) in that workspace
-4. Manages multi-turn sessions via `--resume <session_id>`
+4. Manages durable, per-runner native sessions plus portable cross-runner handoffs
 5. Retries failures with exponential backoff
 6. Reconciles running agents against Linear state changes
 7. Exposes a live web dashboard and terminal UI
@@ -54,18 +54,29 @@ Symphony uses Codex's JSON-RPC `app-server` protocol over stdio. Stokowski uses 
 - First turn: `claude -p "<prompt>" --output-format stream-json --verbose`
 - Continuation: `claude -p "<prompt>" --resume <session_id> --output-format stream-json --verbose`
 
-`--verbose` is required for `stream-json` to work. `session_id` is extracted from the `result` event in the NDJSON stream.
+`--verbose` is required for `stream-json` to work. `session_id` is extracted
+from the `system/init` event in the NDJSON stream, before a turn can stall.
 
 Codex states use its non-interactive CLI path:
-- `codex exec --sandbox danger-full-access --ephemeral --json --cd <workspace> <prompt>`
+- first turn: `codex exec --dangerously-bypass-approvals-and-sandbox --json --cd <workspace> <prompt>`
+- continuation: `codex exec resume --dangerously-bypass-approvals-and-sandbox --json <thread_id> <prompt>`
 - optional per-state `model` and `effort` values become CLI overrides; the
   shared `effort` field maps to `model_reasoning_effort` for Codex
+
+Native identifiers are runner-specific: Claude cannot resume a Codex thread,
+and Codex cannot resume a Claude session. `.stokowski/continuity.json` keeps one
+native identifier per runner plus bounded structured outcomes. On a runner
+switch, the new runner receives the unseen outcomes as a portable handoff. No
+thinking events or full transcripts are persisted there.
 
 ### Python + asyncio instead of Elixir/OTP
 Simpler operational story — single process, no BEAM runtime, no distributed concerns. Concurrency via `asyncio.create_task`. Each agent turn is a subprocess launched with `asyncio.create_subprocess_exec`.
 
 ### No persistent database
-All state lives in memory. The orchestrator recovers from restart by re-polling Linear and re-discovering active issues. Workspace directories on disk act as durable state.
+Scheduling state lives in memory. The orchestrator recovers from restart by
+re-polling Linear and re-discovering active issues. Workspace directories on
+disk hold durable operational state, including per-runner session references
+and bounded handoffs in `.stokowski/continuity.json`.
 
 ### Many workflows, one runtime
 A Linear label chooses which pipeline runs. `workflows/*.yaml` hold one state
@@ -144,7 +155,7 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `ServerConfig` — optional web dashboard port
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
 - `PromptsConfig` — global prompt file reference (a path, or a list of paths loaded in order)
-- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, runner-neutral effort, Claude fallback, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode (`inherit`, `handoff`, or `fresh`), transitions, per-state overrides (model, runner-neutral effort, Claude fallback, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
 
 `ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
 
@@ -203,6 +214,12 @@ while running:
 
 ### runner.py
 `run_agent_turn()` builds Claude CLI args and streams NDJSON output. Codex states route through `run_codex_turn()` and the non-interactive `codex exec` command.
+
+Both runners capture their native session identifier from the first startup
+event. Claude continues with `--resume`; Codex continues with `codex exec
+resume`. Per-state model and effort overrides are still applied on resumed
+turns, which permits a cheaper or more capable model to take over the same
+native conversation.
 
 **PID tracking:** `on_pid` callback registers/unregisters child PIDs with the orchestrator for clean shutdown.
 
@@ -380,7 +397,8 @@ workflow.yaml parsed → states + config loaded
                 ├── Claude: build_claude_args() → claude -p subprocess
                 │   → NDJSON streamed; session_id captured for next turn
                 └── Codex: build_codex_args() → codex exec subprocess
-                    → JSONL activity on stdout; diagnostics on stderr
+                    → JSONL activity on stdout; thread_id captured for next turn
+            → continuity.complete() persists public outcome + runner session
             → _on_worker_exit() called
                 → state transition on success → tracking comment posted
                 → tokens/timing aggregated
@@ -532,6 +550,9 @@ preference to anything installed, silently running old code against new config.
   for a reason that did not apply.
 - **`--resume` needs a session id captured from `system/init`.** Reading it
   only from `result` loses the session on any turn that stalls or times out.
+- **Codex persistence requires omitting `--ephemeral`.** Capture `thread_id`
+  from `thread.started` and resume it with `codex exec resume`; never put a
+  Codex ID in Claude's `--resume` argument or vice versa.
 - **`tty.setraw` vs `tty.setcbreak`**: Don't switch back to `setraw`. It disables `OPOST` output processing and causes Rich log lines to render diagonally (no carriage return on newlines).
 - **`Issue(title=...)` is required**: Minimal Issue constructors (in `linear.py` `fetch_issues_by_states` and the `orchestrator.py` state-check default) must pass `title=""` — it's a required positional field.
 - **`--verbose` with stream-json**: Claude Code requires `--verbose` when using `--output-format stream-json`. Without it you get an error.

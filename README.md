@@ -139,8 +139,8 @@ Linear issue → isolated git clone → agent (Claude or Codex) → PR + Human R
 | Symphony | Stokowski |
 |----------|-----------|
 | `codex app-server` JSON-RPC | `claude -p --output-format stream-json` or `codex exec` |
-| `thread/start` → thread_id | First turn → `session_id` |
-| `turn/start` on thread | `claude -p --resume <session_id>` |
+| `thread/start` → thread_id | First turn → runner-native session ID |
+| `turn/start` on thread | Claude `--resume` or `codex exec resume` |
 | `approval_policy: never` | Codex `-a never` or Claude `--dangerously-skip-permissions` |
 | `thread_sandbox` tools | Codex `-s danger-full-access` or Claude `--allowedTools` list |
 | Elixir/OTP supervision | Python asyncio task pool |
@@ -154,7 +154,7 @@ Linear issue → isolated git clone → agent (Claude or Codex) → PR + Human R
 - **Multi-runner** — Claude Code and Codex in the same pipeline; different states can use different runners and models (e.g. Opus for investigation, Sonnet for implementation, Codex for review)
 - **Three-layer prompt assembly** — global prompt + per-stage prompt + auto-injected lifecycle context; each layer is a Jinja2 template with full issue variables
 - **Linear-driven dispatch** — polls for issues in configured states, dispatches agents with bounded concurrency
-- **Session continuity** — multi-turn agent sessions via `--resume` (Claude Code); agents pick up where they left off
+- **Session continuity** — durable native Claude/Codex sessions across daemon restarts, plus bounded structured handoffs when a workflow switches runners
 - **Isolated workspaces** — per-issue git clones so parallel agents never conflict
 - **Lifecycle hooks** — `after_create`, `before_run`, `after_run`, `before_remove`, `on_stage_enter` shell scripts for setup, quality gates, and cleanup
 - **Retry with backoff** — failed turns retry automatically with exponential backoff
@@ -709,7 +709,7 @@ Each state can override these fields from the root `claude` / `hooks` defaults. 
 | `max_turns` | root `claude.max_turns` | Max turns for this state |
 | `turn_timeout_ms` | root value | Per-turn timeout |
 | `stall_timeout_ms` | root value | Stall detection timeout |
-| `session` | `inherit` | `inherit` (resume prior session) or `fresh` (new session, no prior context) |
+| `session` | `inherit` | `inherit` resumes this runner and injects unseen cross-runner outcomes; `handoff` starts a new native session with portable prior outcomes; `fresh` starts with neither |
 | `permission_mode` | root value | Permission mode override |
 | `allowed_tools` | root value | Tool whitelist override |
 | `hooks` | root value | State-specific lifecycle hooks |
@@ -877,9 +877,14 @@ prompts/       →  Jinja2 stage prompt files
     ├── Claude Code: claude -p --output-format stream-json
     │   └── --resume <session_id>  (multi-turn continuity)
     ├── Codex: codex exec --json
-    │   └── JSONL events drive live activity, messages, token usage, and stalls
+    │   └── codex exec resume <thread_id>  (multi-turn continuity)
     ├── stall detection + turn timeout
     └── PID tracking for clean shutdown
+          │
+          ▼
+    .stokowski/continuity.json
+    ├── one native session reference per runner
+    └── bounded public handoffs for runner switches and restart recovery
           │
           ▼
     Agent (headless)
