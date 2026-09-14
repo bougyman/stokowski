@@ -17,6 +17,8 @@ All notable changes to Stokowski are documented here.
 - fix: launch Codex through the current non-interactive `codex exec` command
 - Use one `effort` field for Claude and Codex instead of a Codex-only
   `reasoning_effort` field.
+- Refresh the Workflow Studio catalogue for GPT-5.6 Sol/Terra/Luna and Claude
+  Opus/Sonnet/Haiku 5; remove the unavailable Fable entry.
 
 ### Fixed
 

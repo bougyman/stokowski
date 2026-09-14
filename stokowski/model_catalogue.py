@@ -19,23 +19,17 @@ MODELS: dict[str, list[str]] = {
     "Claude — current": [
         "claude-opus-5",
         "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-haiku-4-5",
-    ],
-    "Claude — previous": [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
+        "claude-haiku-5",
     ],
     # Used by states with `runner: codex`. The Codex CLI takes `-m/--model`;
     # these are the ids it documents. Unlisted values still work.
     "Codex (OpenAI)": [
-        "gpt-5-codex",
-        "gpt-5",
-        "o3",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
     ],
 }
+
 
 def catalogue(*, in_use: list[str] | None = None) -> list[dict[str, object]]:
     """Model groups for the studio, with anything already in use kept first.
