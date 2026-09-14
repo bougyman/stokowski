@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import unittest
@@ -78,6 +79,65 @@ class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempt.status, "succeeded")
         self.assertIs(spawn_kwargs["stdin"], asyncio.subprocess.DEVNULL)
+
+    @patch("stokowski.runner.build_codex_args")
+    async def test_filters_environment_at_subprocess_boundary(self, build_args):
+        create_subprocess_exec = asyncio.create_subprocess_exec
+        spawn_kwargs = {}
+
+        async def capture_spawn(*args, **kwargs):
+            spawn_kwargs.update(kwargs)
+            return await create_subprocess_exec(*args, **kwargs)
+
+        requested_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "LINEAR_API_KEY": "declared-secret",
+            "STOKOWSKI_PROJECT": "example",
+            "AMBIENT_API_TOKEN": "must-not-cross-boundary",
+            "UNRELATED": "drop",
+        }
+
+        with TemporaryDirectory() as directory:
+            observed_path = Path(directory) / "observed-env.json"
+            script = (
+                "import json, os\n"
+                f"open({str(observed_path)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+                "print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n"
+            )
+            build_args.return_value = [sys.executable, "-c", script]
+
+            with patch(
+                "stokowski.runner.asyncio.create_subprocess_exec",
+                side_effect=capture_spawn,
+            ):
+                attempt = await run_codex_turn(
+                    model=None,
+                    hooks_cfg=HooksConfig(),
+                    prompt="Investigate",
+                    workspace_path=Path(directory),
+                    issue=self.issue(),
+                    attempt=self.attempt(),
+                    turn_timeout_ms=2_000,
+                    stall_timeout_ms=500,
+                    env=requested_env,
+                )
+
+            observed_env = json.loads(observed_path.read_text())
+
+        self.assertEqual(attempt.status, "succeeded")
+        expected_env = {
+            "PATH": requested_env["PATH"],
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "LINEAR_API_KEY": "declared-secret",
+            "STOKOWSKI_PROJECT": "example",
+        }
+        self.assertEqual(spawn_kwargs["env"], expected_env)
+        self.assertEqual(
+            {key: observed_env.get(key) for key in expected_env}, expected_env
+        )
+        self.assertNotIn("AMBIENT_API_TOKEN", observed_env)
+        self.assertNotIn("UNRELATED", observed_env)
 
     @patch("stokowski.runner.build_codex_args")
     async def test_parses_and_logs_json_events(self, build_args):

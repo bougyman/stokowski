@@ -11,7 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import CODEX_REASONING_EFFORTS, ClaudeConfig, HooksConfig
+from .config import (
+    CODEX_REASONING_EFFORTS,
+    ClaudeConfig,
+    HooksConfig,
+    build_agent_env,
+)
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
@@ -254,7 +259,7 @@ async def run_codex_turn(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=build_agent_env(env),
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
@@ -491,7 +496,7 @@ async def run_agent_turn(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=build_agent_env(env),
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
