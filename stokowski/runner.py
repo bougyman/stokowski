@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import CODEX_REASONING_EFFORTS, ClaudeConfig, HooksConfig
+from .config import SUPPORTED_EFFORTS, ClaudeConfig, HooksConfig
 from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
 
@@ -189,6 +189,8 @@ def build_claude_args(
     # Reasoning effort. Cheap stages (a merge) rarely need more than low;
     # a grounding check earns high or above.
     if claude_cfg.effort:
+        if claude_cfg.effort not in SUPPORTED_EFFORTS:
+            raise ValueError(f"Unsupported Claude effort: {claude_cfg.effort!r}")
         args.extend(["--effort", claude_cfg.effort])
 
     # System prompt - always include headless context, plus any user additions
@@ -204,14 +206,11 @@ def build_codex_args(
     model: str | None,
     prompt: str,
     workspace_path: Path,
-    reasoning_effort: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """Build a non-interactive Codex JSONL invocation."""
-    if (
-        reasoning_effort is not None
-        and reasoning_effort not in CODEX_REASONING_EFFORTS
-    ):
-        raise ValueError(f"Unsupported Codex reasoning effort: {reasoning_effort!r}")
+    if effort is not None and effort not in SUPPORTED_EFFORTS:
+        raise ValueError(f"Unsupported Codex effort: {effort!r}")
 
     args = [
         "codex",
@@ -227,10 +226,8 @@ def build_codex_args(
     ]
     if model:
         args.extend(["--model", model])
-    if reasoning_effort:
-        args.extend(
-            ["--config", f'model_reasoning_effort="{reasoning_effort}"']
-        )
+    if effort:
+        args.extend(["--config", f'model_reasoning_effort="{effort}"'])
     args.append(prompt)
     return args
 
@@ -242,7 +239,7 @@ async def run_codex_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
-    reasoning_effort: str | None = None,
+    effort: str | None = None,
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     turn_timeout_ms: int = 3_600_000,
@@ -254,7 +251,7 @@ async def run_codex_turn(
     Codex sessions are ephemeral here, so each state gets a fresh run. JSONL
     output keeps the activity monitor updated during long-running turns.
     """
-    args = build_codex_args(model, prompt, workspace_path, reasoning_effort)
+    args = build_codex_args(model, prompt, workspace_path, effort)
 
     # Run before_run hook
     if hooks_cfg.before_run:
@@ -652,7 +649,6 @@ async def run_turn(
     workspace_path: Path,
     issue: Issue,
     attempt: RunAttempt,
-    reasoning_effort: str | None = None,
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
@@ -661,7 +657,7 @@ async def run_turn(
     if runner_type == "codex":
         return await run_codex_turn(
             model=claude_cfg.model,
-            reasoning_effort=reasoning_effort,
+            effort=claude_cfg.effort,
             hooks_cfg=hooks_cfg,
             prompt=prompt,
             workspace_path=workspace_path,

@@ -12,6 +12,8 @@ untouched. A stale entry here can never stop an operator running a new model.
 
 from __future__ import annotations
 
+from .config import EFFORT_LEVELS
+
 # provider label -> ordered model ids, most capable first within each family.
 MODELS: dict[str, list[str]] = {
     "Claude — current": [
@@ -34,11 +36,6 @@ MODELS: dict[str, list[str]] = {
         "o3",
     ],
 }
-
-# Reasoning effort, passed to the Claude CLI as --effort. Higher costs more and
-# takes longer; the CLI defaults to high when unset.
-EFFORT_LEVELS: list[str] = ["low", "medium", "high", "xhigh", "max"]
-
 
 def catalogue(*, in_use: list[str] | None = None) -> list[dict[str, object]]:
     """Model groups for the studio, with anything already in use kept first.

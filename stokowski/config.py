@@ -14,9 +14,8 @@ import yaml
 
 logger = logging.getLogger("stokowski.config")
 
-CODEX_REASONING_EFFORTS = frozenset(
-    {"minimal", "low", "medium", "high", "xhigh"}
-)
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+SUPPORTED_EFFORTS = frozenset(EFFORT_LEVELS)
 
 
 @dataclass
@@ -185,7 +184,6 @@ class StateConfig:
     linear_state: str = "active"     # key into LinearStatesConfig
     runner: str = "claude"
     model: str | None = None
-    reasoning_effort: str | None = None
     max_turns: int | None = None
     effort: str | None = None
     fallback_model: str | None = None
@@ -473,6 +471,11 @@ def _parse_hooks(raw: dict[str, Any] | None) -> HooksConfig | None:
 
 def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
     """Parse a single state entry from YAML into StateConfig."""
+    if "reasoning_effort" in raw:
+        raise ValueError(
+            f"state '{name}': 'reasoning_effort' was removed; use 'effort'"
+        )
+
     allowed = raw.get("allowed_tools")
     hooks_raw = raw.get("hooks")
 
@@ -483,13 +486,12 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         linear_state=str(raw.get("linear_state", "active")),
         runner=str(raw.get("runner", "claude")),
         model=raw.get("model"),
-        reasoning_effort=(
-            str(raw["reasoning_effort"]).strip().lower()
-            if raw.get("reasoning_effort") is not None
+        max_turns=raw.get("max_turns"),
+        effort=(
+            str(raw["effort"]).strip().lower()
+            if raw.get("effort") is not None
             else None
         ),
-        max_turns=raw.get("max_turns"),
-        effort=raw.get("effort"),
         fallback_model=raw.get("fallback_model"),
         turn_timeout_ms=raw.get("turn_timeout_ms"),
         stall_timeout_ms=raw.get("stall_timeout_ms"),
@@ -517,7 +519,11 @@ def merge_state_config(
             else (None if state.runner == "codex" else root_claude.model)
         ),
         max_turns=state.max_turns if state.max_turns is not None else root_claude.max_turns,
-        effort=state.effort if state.effort is not None else root_claude.effort,
+        effort=(
+            state.effort
+            if state.effort is not None
+            else (None if state.runner == "codex" else root_claude.effort)
+        ),
         fallback_model=(
             state.fallback_model if state.fallback_model is not None
             else root_claude.fallback_model
@@ -572,7 +578,11 @@ def _parse_claude(raw: dict[str, Any]) -> ClaudeConfig:
         or ["Bash", "Read", "Edit", "Write", "Glob", "Grep"],
         model=raw.get("model"),
         max_turns=_coerce_int(raw.get("max_turns"), 20),
-        effort=raw.get("effort"),
+        effort=(
+            str(raw["effort"]).strip().lower()
+            if raw.get("effort") is not None
+            else None
+        ),
         fallback_model=raw.get("fallback_model"),
         turn_timeout_ms=_coerce_int(raw.get("turn_timeout_ms"), 3_600_000),
         stall_timeout_ms=_coerce_int(raw.get("stall_timeout_ms"), 300_000),
@@ -901,6 +911,14 @@ def _validate_project(project: ProjectConfig, errors: list[str]) -> None:
             f"{prefix}: unsupported tracker.assignee: "
             f"{project.tracker.assignee!r} (only 'me' is supported)"
         )
+    if (
+        project.claude.effort is not None
+        and project.claude.effort not in SUPPORTED_EFFORTS
+    ):
+        errors.append(
+            f"{prefix}: unsupported claude.effort: {project.claude.effort!r} "
+            f"(valid: {', '.join(EFFORT_LEVELS)})"
+        )
 
     for gp in global_prompt_paths(getattr(project.prompts, "global_prompt", None)):
         if not _prompt_exists(project.workflow_dir, gp):
@@ -989,17 +1007,10 @@ def _validate_states(
                 errors.append(
                     f"{prefix} state '{name}': unsupported runner: {sc.runner}"
                 )
-            if (
-                sc.reasoning_effort is not None
-                and sc.reasoning_effort not in CODEX_REASONING_EFFORTS
-            ):
+            if sc.effort is not None and sc.effort not in SUPPORTED_EFFORTS:
                 errors.append(
-                    f"{prefix} state '{name}': unsupported reasoning_effort: "
-                    f"{sc.reasoning_effort!r}"
-                )
-            elif sc.reasoning_effort is not None and sc.runner != "codex":
-                errors.append(
-                    f"{prefix} state '{name}': reasoning_effort requires runner: codex"
+                    f"{prefix} state '{name}': unsupported effort: {sc.effort!r} "
+                    f"(valid: {', '.join(EFFORT_LEVELS)})"
                 )
 
         elif sc.type == "gate":
