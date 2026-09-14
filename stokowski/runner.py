@@ -189,15 +189,13 @@ def build_codex_args(
         "codex",
         "exec",
         "--sandbox",
-        "workspace-write",
+        "danger-full-access",
         "--ephemeral",
         "--json",
         "--cd",
         str(workspace_path),
         "--config",
         'approval_policy="never"',
-        "--config",
-        "sandbox_workspace_write.network_access=true",
     ]
     if model:
         args.extend(["--model", model])
