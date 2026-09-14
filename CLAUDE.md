@@ -58,7 +58,8 @@ Symphony uses Codex's JSON-RPC `app-server` protocol over stdio. Stokowski uses 
 
 Codex states use its non-interactive CLI path:
 - `codex exec --sandbox danger-full-access --ephemeral --json --cd <workspace> <prompt>`
-- optional per-state `model` and `reasoning_effort` values become CLI overrides
+- optional per-state `model` and `effort` values become CLI overrides; the
+  shared `effort` field maps to `model_reasoning_effort` for Codex
 
 ### Python + asyncio instead of Elixir/OTP
 Simpler operational story — single process, no BEAM runtime, no distributed concerns. Concurrency via `asyncio.create_task`. Each agent turn is a subprocess launched with `asyncio.create_subprocess_exec`.
@@ -143,7 +144,7 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `ServerConfig` — optional web dashboard port
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
 - `PromptsConfig` — global prompt file reference (a path, or a list of paths loaded in order)
-- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, Claude effort and fallback, Codex reasoning effort, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, runner-neutral effort, Claude fallback, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
 
 `ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
 

@@ -1160,14 +1160,12 @@ class Orchestrator:
             claude_cfg = self.cfg.claude
             hooks_cfg = self.cfg.hooks
             runner_type = "claude"
-            reasoning_effort = None
 
             if state_cfg:
                 claude_cfg, hooks_cfg = merge_state_config(
                     state_cfg, self.cfg.claude, self.cfg.hooks
                 )
                 runner_type = state_cfg.runner
-                reasoning_effort = state_cfg.reasoning_effort
 
             ws_root = self.cfg.workspace.resolved_root()
             ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
@@ -1246,7 +1244,6 @@ class Orchestrator:
                     workspace_path=ws.path,
                     issue=issue,
                     attempt=attempt,
-                    reasoning_effort=reasoning_effort,
                     on_event=self._on_agent_event,
                     on_pid=self._on_child_pid,
                     env=agent_env,
@@ -1303,7 +1300,6 @@ class Orchestrator:
                         workspace_path=ws.path,
                         issue=issue,
                         attempt=attempt,
-                        reasoning_effort=reasoning_effort,
                         on_event=self._on_agent_event,
                         on_pid=self._on_child_pid,
                         env=agent_env,

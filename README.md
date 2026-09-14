@@ -672,7 +672,7 @@ states:                                # the state machine pipeline
     prompt: prompts/code-review.md
     linear_state: active
     runner: codex                      # use Codex for an independent review
-    reasoning_effort: high             # minimal, low, medium, high, or xhigh
+    effort: xhigh                      # low, medium, high, xhigh, or max
     session: fresh                     # fresh session — no prior context
     transitions:
       complete: review_merge
@@ -705,7 +705,7 @@ Each state can override these fields from the root `claude` / `hooks` defaults. 
 |-------|---------|-------------|
 | `runner` | `claude` | `claude` (Claude Code CLI) or `codex` (Codex CLI) |
 | `model` | runner default | Model override for this state; Codex states do not inherit a root Claude model |
-| `reasoning_effort` | Codex default | Codex-only reasoning override: `minimal`, `low`, `medium`, `high`, or `xhigh` |
+| `effort` | runner default | Reasoning effort for either runner: `low`, `medium`, `high`, `xhigh`, or `max` |
 | `max_turns` | root `claude.max_turns` | Max turns for this state |
 | `turn_timeout_ms` | root value | Per-turn timeout |
 | `stall_timeout_ms` | root value | Stall detection timeout |
