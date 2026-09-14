@@ -142,7 +142,7 @@ Linear issue → isolated git clone → agent (Claude or Codex) → PR + Human R
 | `thread/start` → thread_id | First turn → `session_id` |
 | `turn/start` on thread | `claude -p --resume <session_id>` |
 | `approval_policy: never` | Codex `-a never` or Claude `--dangerously-skip-permissions` |
-| `thread_sandbox` tools | Codex `-s workspace-write` or Claude `--allowedTools` list |
+| `thread_sandbox` tools | Codex `-s danger-full-access` or Claude `--allowedTools` list |
 | Elixir/OTP supervision | Python asyncio task pool |
 
 ---
@@ -937,10 +937,10 @@ git diff HEAD@{1} workflow.example.yaml
 ## Security
 
 - **`permission_mode: auto`** passes `--dangerously-skip-permissions` to Claude Code. Agents can execute arbitrary commands in the workspace. Only use in trusted environments or Docker containers.
-- Codex turns use approval policy `never` with the `workspace-write` sandbox, so denied operations fail instead of waiting for interactive approval.
+- Codex turns use approval policy `never` with the `danger-full-access` sandbox so agents can create branches, commit, and update submodules without waiting for interactive approval. Only run Stokowski against trusted repositories in a controlled environment.
 - **`permission_mode: allowedTools`** scopes Claude Code to a specific tool list — safer for production.
 - API keys live in `workflow.yaml`, which is gitignored. They are passed to agent subprocesses as env vars automatically.
-- Each agent only has access to its own isolated workspace directory.
+- Each agent receives its own workspace checkout, but Codex's `danger-full-access` mode is not OS-level isolation. Use a container or another externally sandboxed environment when stronger isolation is required.
 
 ---
 

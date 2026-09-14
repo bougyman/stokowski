@@ -50,7 +50,7 @@ Symphony uses Codex's JSON-RPC `app-server` protocol over stdio. Stokowski uses 
 `--verbose` is required for `stream-json` to work. `session_id` is extracted from the `result` event in the NDJSON stream.
 
 Codex states use its non-interactive CLI path:
-- `codex exec --sandbox workspace-write --ephemeral --json --cd <workspace> <prompt>`
+- `codex exec --sandbox danger-full-access --ephemeral --json --cd <workspace> <prompt>`
 - optional per-state `model` and `reasoning_effort` values become CLI overrides
 
 ### Python + asyncio instead of Elixir/OTP
