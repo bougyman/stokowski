@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import SUPPORTED_EFFORTS, ClaudeConfig, HooksConfig
+from .config import SUPPORTED_EFFORTS, ClaudeConfig, HooksConfig, build_agent_env
 from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
 
@@ -298,7 +298,7 @@ async def run_codex_turn(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=build_agent_env(env),
         )
         attempt.process_started = True
         if on_pid and proc.pid:
@@ -536,7 +536,7 @@ async def run_agent_turn(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=build_agent_env(env),
         )
         attempt.process_started = True
         if on_pid and proc.pid:

@@ -8,7 +8,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -17,6 +17,37 @@ logger = logging.getLogger("stokowski.config")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 SUPPORTED_EFFORTS = frozenset(EFFORT_LEVELS)
 SESSION_MODES = ("inherit", "handoff", "fresh")
+AGENT_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "TERM",
+        "TMPDIR",
+        "USER",
+    }
+)
+AGENT_PROJECT_ENV = frozenset(
+    {
+        "LINEAR_API_KEY",
+        "LINEAR_ENDPOINT",
+        "LINEAR_PROJECT_SLUG",
+        "STOKOWSKI_PROJECT",
+        "STOKOWSKI_ARTIFACTS",
+        "STOKOWSKI_ISSUE",
+        "STOKOWSKI_STATE",
+    }
+)
+
+
+def build_agent_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return only inherited and project values allowed in agent processes."""
+    values = os.environ if source is None else source
+    allowed = AGENT_ENV_ALLOWLIST | AGENT_PROJECT_ENV
+    return {key: value for key, value in values.items() if key in allowed}
 
 
 @dataclass
@@ -234,7 +265,7 @@ class ProjectConfig:
 
     def agent_env(self) -> dict[str, str]:
         """Build env vars to pass to agent subprocesses for this project."""
-        env = dict(os.environ)
+        env = build_agent_env()
         api_key = self.resolved_api_key()
         if api_key:
             env["LINEAR_API_KEY"] = api_key
@@ -339,7 +370,7 @@ class ServiceConfig:
     def agent_env(self) -> dict[str, str]:
         if self.projects:
             return self.projects[0].agent_env()
-        env = dict(os.environ)
+        env = build_agent_env()
         if self.tracker.api_key:
             env["LINEAR_API_KEY"] = self.resolved_api_key()
         if self.tracker.project_slug:
