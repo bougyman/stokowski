@@ -31,6 +31,10 @@ from .pool import ConcurrencyPool
 from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
+from . import artifacts as artifacts_mod
+from . import report as report_mod
+from .events import summarise_tool_input
+from .ledger import Ledger
 from .workspace import ensure_workspace, remove_workspace
 
 logger = logging.getLogger("stokowski")
@@ -69,8 +73,22 @@ class Orchestrator:
         # Aggregate metrics
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        self.total_cache_creation_tokens: int = 0
+        self.total_cache_read_tokens: int = 0
         self.total_tokens: int = 0
+        self.total_cost_usd: float = 0.0
+        self.total_tool_calls: int = 0
         self.total_seconds_running: float = 0
+        # Most recent rate-limit window seen from any agent. Shared across the
+        # whole account, so the latest observation is the accurate one.
+        self.rate_limit: dict[str, Any] | None = None
+        # Append-only record of runs and the human verdicts on them. In-memory
+        # state is rebuilt from Linear on restart; this is the only thing that
+        # remembers how previous work was judged.
+        # Note: no `self.cfg` here — the workflow is not loaded until the
+        # first tick, and `cfg` asserts on that. The ledger path is derived
+        # from the workflow file alone, which is known at construction.
+        self.ledger = Ledger.for_workflow(Path(self.workflow_path))
 
         # Internal
         self._linear: LinearClient | None = None
@@ -84,8 +102,18 @@ class Orchestrator:
         self._last_completed_at: dict[str, datetime] = {}  # issue_id -> last worker completion time
 
         # State machine tracking
-        self._issue_current_state: dict[str, str] = {}   # issue_id -> internal state name
+        self._issue_current_state: dict[str, str] = {}
+        # Which workflow each issue is running. Pinned on first dispatch and
+        # kept for the issue's lifetime: editing labels mid-run must not switch
+        # the pipeline under a working agent.
+        self._issue_workflow: dict[str, str] = {}   # issue_id -> internal state name
         self._issue_state_runs: dict[str, int] = {}       # issue_id -> run number for current state
+        # (issue_id, state, run) already announced in Linear. Two call sites
+        # post the entering-a-state comment — the transition, and the worker
+        # that picks the state up ~1s later — and a continuation can re-enter
+        # the worker path with the same run. COG-368 got three identical
+        # "Entering state: implement" comments in 1.7 seconds.
+        self._announced_states: set[tuple[str, str, int]] = set()
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
 
         # Eligible-but-not-dispatched (queue panel data, refreshed each tick)
@@ -114,6 +142,11 @@ class Orchestrator:
             linear_states=project.linear_states,
             prompts=project.prompts,
             states=project.states,
+            # Without these the orchestrator sees no workflows at all, so every
+            # issue silently falls back to the inline state machine and routing
+            # never fires.
+            workflows=project.workflows,
+            routing=project.routing,
             projects=[project],
             workflow_dir=full.config.workflow_dir,
         )
@@ -153,6 +186,80 @@ class Orchestrator:
         return []
 
     # ── Slot management ────────────────────────────────────────────────────
+
+    # ── Workflow resolution ──────────────────────────────────────────────
+
+    def _adopt_workflow_from_tracking(self, issue: Issue, tracking: dict | None) -> None:
+        """Restore an issue's pinned workflow from its tracking comment.
+
+        In-memory pins are lost on restart. Recovering from Linear keeps a
+        long-running issue on the pipeline it started, rather than re-routing
+        it from labels that may have changed since.
+        """
+        if not tracking:
+            return
+        name = tracking.get("workflow")
+        if name and name in self.cfg.workflows:
+            self._issue_workflow[issue.id] = name
+
+    def _workflow_name_for(self, issue: Issue) -> str | None:
+        """Resolve (and pin) the workflow an issue runs under.
+
+        Pinned on first sight rather than re-read each tick, because labels are
+        editable: a ticket relabelled halfway through implementation must not
+        suddenly be evaluated against a different state machine.
+        """
+        pinned = self._issue_workflow.get(issue.id)
+        if pinned and pinned in self.cfg.workflows:
+            return pinned
+
+        name = self.cfg.routing.resolve(issue.labels)
+        if name and name in self.cfg.workflows:
+            self._issue_workflow[issue.id] = name
+            logger.info(
+                f"Routed {issue.identifier} to workflow '{name}'"
+                + (f" (labels: {', '.join(issue.labels)})" if issue.labels else " (no labels)"),
+                extra={"linked_to": issue.identifier},
+            )
+            return name
+
+        if name:
+            logger.warning(
+                f"{issue.identifier} routes to unknown workflow '{name}'",
+                extra={"linked_to": issue.identifier},
+            )
+        return None
+
+    def _workflow_for(self, issue: Issue):
+        """The WorkflowSpec an issue runs under, or None."""
+        name = self._workflow_name_for(issue)
+        return self.cfg.workflows.get(name) if name else None
+
+    def _entry_state_for(self, issue: Issue) -> str | None:
+        """The entry state of the pipeline THIS issue runs under.
+
+        `cfg.entry_state` answers a different question — the first agent state
+        of the inline `states:` block. Every workflow but `bug-fix` happens to
+        start with `investigate`, so using it looked correct until a
+        bug-labelled ticket arrived and was started in a state `bug-fix` does
+        not have.
+        """
+        workflow = self._workflow_for(issue)
+        if workflow is not None:
+            entry = workflow.entry_state
+            if entry:
+                return entry
+        return self.cfg.entry_state
+
+    def _states_for(self, issue: Issue) -> dict:
+        """The state machine an issue runs under.
+
+        Falls back to the config's inline states so a single-pipeline setup —
+        and any issue whose routing failed — behaves exactly as before.
+        """
+        workflow = self._workflow_for(issue)
+        return workflow.states if workflow else self.cfg.states
+
 
     def _has_slot(self) -> tuple[bool, str | None]:
         """Return (can_dispatch, reason_if_not). Considers pause + global cap."""
@@ -296,8 +403,11 @@ class Orchestrator:
         client = self._ensure_linear_client()
         comments = await client.fetch_comments(issue.id)
         tracking = parse_latest_tracking(comments)
+        # Restore the pipeline this issue started on before interpreting its
+        # state — a state name only means something inside its own workflow.
+        self._adopt_workflow_from_tracking(issue, tracking)
 
-        entry = self.cfg.entry_state
+        entry = self._entry_state_for(issue)
         if entry is None:
             raise RuntimeError("No entry state defined in config")
 
@@ -310,11 +420,19 @@ class Orchestrator:
         if tracking["type"] == "state":
             state_name = tracking.get("state", entry)
             run = tracking.get("run", 1)
-            if state_name in self.cfg.states:
+            if state_name in self._states_for(issue):
                 self._issue_current_state[issue.id] = state_name
                 self._issue_state_runs[issue.id] = run
                 return state_name, run
-            # Unknown state → fallback to entry
+            # Unknown state → restart at this workflow's entry. Loud, because
+            # a state that is not in the issue's own machine means the issue
+            # was started on the wrong pipeline and has been going nowhere.
+            logger.warning(
+                f"Issue {issue.identifier} records state '{state_name}', which is "
+                f"not in workflow '{self._workflow_name_for(issue)}' — restarting "
+                f"at '{entry}'",
+                extra={"linked_to": issue.identifier},
+            )
             self._issue_current_state[issue.id] = entry
             self._issue_state_runs[issue.id] = 1
             return entry, 1
@@ -325,14 +443,14 @@ class Orchestrator:
             run = tracking.get("run", 1)
 
             if status == "waiting":
-                if gate_state in self.cfg.states:
+                if gate_state in self._states_for(issue):
                     self._issue_current_state[issue.id] = gate_state
                     self._issue_state_runs[issue.id] = run
                     self._pending_gates[issue.id] = gate_state
                     return gate_state, run
 
             elif status == "approved":
-                gate_cfg = self.cfg.states.get(gate_state)
+                gate_cfg = self._states_for(issue).get(gate_state)
                 if gate_cfg and "approve" in gate_cfg.transitions:
                     target = gate_cfg.transitions["approve"]
                     self._issue_current_state[issue.id] = target
@@ -340,11 +458,11 @@ class Orchestrator:
                     return target, run
 
             elif status == "rework":
-                gate_cfg = self.cfg.states.get(gate_state)
+                gate_cfg = self._states_for(issue).get(gate_state)
                 rework_to = tracking.get("rework_to", "")
                 if not rework_to and gate_cfg:
                     rework_to = gate_cfg.rework_to or ""
-                if rework_to and rework_to in self.cfg.states:
+                if rework_to and rework_to in self._states_for(issue):
                     self._issue_current_state[issue.id] = rework_to
                     self._issue_state_runs[issue.id] = run
                     return rework_to, run
@@ -368,7 +486,7 @@ class Orchestrator:
 
     async def _enter_gate(self, issue: Issue, state_name: str):
         """Move issue to gate state and post tracking comment."""
-        state_cfg = self.cfg.states.get(state_name)
+        state_cfg = self._states_for(issue).get(state_name)
         prompt = state_cfg.prompt if state_cfg else ""
         run = self._issue_state_runs.get(issue.id, 1)
 
@@ -450,7 +568,7 @@ class Orchestrator:
             logger.warning(f"No current state for {issue.identifier}, cannot transition", extra={"linked_to": issue.identifier})
             return
 
-        current_cfg = self.cfg.states.get(current_state_name)
+        current_cfg = self._states_for(issue).get(current_state_name)
         if not current_cfg:
             logger.warning(f"Unknown state '{current_state_name}' for {issue.identifier}", extra={"linked_to": issue.identifier})
             return
@@ -464,7 +582,7 @@ class Orchestrator:
             )
             return
 
-        target_cfg = self.cfg.states.get(target_name)
+        target_cfg = self._states_for(issue).get(target_name)
         if not target_cfg:
             logger.warning(f"Transition target '{target_name}' not found in config")
             return
@@ -483,6 +601,11 @@ class Orchestrator:
                     logger.warning(f"Failed to move {issue.identifier} to terminal state '{terminal_state}'", extra={"linked_to": issue.identifier})
             except Exception as e:
                 logger.warning(f"Failed to move {issue.identifier} to terminal: {e}", extra={"linked_to": issue.identifier})
+            self.ledger.record_terminal(
+                project=self.project_name or "", issue_id=issue.id,
+                issue=issue.identifier, state=terminal_state,
+            )
+
             # Clean up workspace
             try:
                 ws_root = self.cfg.workspace.resolved_root()
@@ -492,6 +615,7 @@ class Orchestrator:
             # Clean up tracking state
             self._issue_current_state.pop(issue.id, None)
             self._issue_state_runs.pop(issue.id, None)
+            self._announced_states = {k for k in self._announced_states if k[0] != issue.id}
             self._pending_gates.pop(issue.id, None)
             self._last_session_ids.pop(issue.id, None)
             self.claimed.discard(issue.id)
@@ -504,14 +628,10 @@ class Orchestrator:
         else:
             # Agent state — post state comment, ensure active Linear state, schedule retry
             self._issue_current_state[issue.id] = target_name
-            client = self._ensure_linear_client()
-            comment = make_state_comment(
-                state=target_name,
-                run=run,
-            )
-            await client.post_comment(issue.id, comment)
+            await self._announce_state(issue, target_name, run)
 
             # Ensure issue is in active Linear state
+            client = self._ensure_linear_client()
             active_state = self.cfg.linear_states.active
             moved = await client.update_issue_state(issue.id, active_state)
             if not moved:
@@ -519,10 +639,24 @@ class Orchestrator:
 
             self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
 
+    async def _announce_state(self, issue, state: str, run: int) -> None:
+        """Post the entering-a-state comment, at most once per (state, run)."""
+        key = (issue.id, state, run)
+        if key in self._announced_states:
+            return
+        self._announced_states.add(key)
+        client = self._ensure_linear_client()
+        comment = make_state_comment(
+            state=state,
+            run=run,
+            workflow=self._workflow_name_for(issue),
+        )
+        await client.post_comment(issue.id, comment)
+
     async def _handle_gate_responses(self):
         """Check for gate-approved and rework issues, handle transitions."""
         # Early return if no gate states in config
-        has_gates = any(sc.type == "gate" for sc in self.cfg.states.values())
+        has_gates = any(sc.type == "gate" for sc in self.cfg.all_states().values())
         if not has_gates:
             return
 
@@ -571,8 +705,24 @@ class Orchestrator:
                 # gate transitions directly to a terminal state.
                 self._issue_current_state[issue.id] = gate_state
                 self._last_issues[issue.id] = issue
+                # A gate decision IS the human verdict on the work. Recording
+                # it here is what makes approval rate by classification and by
+                # the agent's own stated confidence measurable later.
+                self.ledger.record_gate(
+                    workflow=self._workflow_name_for(issue),
+                    project=self.project_name or "", issue_id=issue.id,
+                    issue=issue.identifier, gate=gate_state,
+                    verdict="approved", run=run,
+                )
                 await self._transition(issue, "approve")
                 logger.info(f"Gate approved issue={issue.identifier} gate={gate_state}", extra={"linked_to": issue.identifier})
+            else:
+                logger.warning(
+                    f"Issue {issue.identifier} is in "
+                    f"'{self.cfg.linear_states.gate_approved}' but no gate could be "
+                    f"resolved from its tracking comments — it will not advance",
+                    extra={"linked_to": issue.identifier},
+                )
 
         # Fetch rework issues
         try:
@@ -597,7 +747,7 @@ class Orchestrator:
                     gate_state = tracking.get("state", "")
 
             if gate_state:
-                gate_cfg = self.cfg.states.get(gate_state)
+                gate_cfg = self._states_for(issue).get(gate_state)
                 rework_to = gate_cfg.rework_to if gate_cfg else ""
                 if not rework_to:
                     logger.warning(f"Gate {gate_state} has no rework_to target, skipping")
@@ -622,6 +772,15 @@ class Orchestrator:
                 new_run = run + 1
                 self._issue_state_runs[issue.id] = new_run
 
+                # Recorded against the run that was rejected, not the retry, so
+                # the verdict attaches to the work a human actually judged.
+                self.ledger.record_gate(
+                    workflow=self._workflow_name_for(issue),
+                    project=self.project_name or "", issue_id=issue.id,
+                    issue=issue.identifier, gate=gate_state,
+                    verdict="rework", run=run,
+                )
+
                 comment = make_gate_comment(
                     state=gate_state, status="rework",
                     rework_to=rework_to, run=new_run,
@@ -640,6 +799,16 @@ class Orchestrator:
                 logger.info(
                     f"Rework issue={issue.identifier} gate={gate_state} "
                     f"rework_to={rework_to} run={new_run}",
+                    extra={"linked_to": issue.identifier},
+                )
+            else:
+                # A ticket parked in Rework with no resolvable gate goes nowhere
+                # and nothing says so. Silence here is what let the comment
+                # ordering bug sit unnoticed across every gate.
+                logger.warning(
+                    f"Issue {issue.identifier} is in '{self.cfg.linear_states.rework}' "
+                    f"but no gate could be resolved from its tracking comments — "
+                    f"it will not advance",
                     extra={"linked_to": issue.identifier},
                 )
 
@@ -678,6 +847,7 @@ class Orchestrator:
                 gate_state = self._pending_gates.pop(issue_id, None)
                 self._issue_current_state.pop(issue_id, None)
                 self._issue_state_runs.pop(issue_id, None)
+                self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
                 self._last_session_ids.pop(issue_id, None)
                 self.claimed.discard(issue_id)
                 ident = self._last_issues.get(
@@ -756,14 +926,14 @@ class Orchestrator:
             if tracking and tracking.get("type") == "gate":
                 tracked_name = tracking.get("state", "")
                 run = tracking.get("run", 1)
-                if tracked_name in self.cfg.states:
+                if tracked_name in self._states_for(issue):
                     gate_state = tracked_name
 
             # Fallback: derive gate state from the current Linear state name by
             # matching against configured gate states' linear_state keys
             if not gate_state:
                 current_linear = issue.state.strip().lower()
-                for gname, gcfg in self.cfg.states.items():
+                for gname, gcfg in self._states_for(issue).items():
                     if gcfg.type == "gate":
                         gate_linear = _resolve_linear_state_name(
                             gcfg.linear_state, self.cfg.linear_states
@@ -926,11 +1096,11 @@ class Orchestrator:
 
         state_name = self._issue_current_state.get(issue.id)
         if not state_name:
-            state_name = self.cfg.entry_state
+            state_name = self._entry_state_for(issue)
 
         # If at a gate, enter it instead of dispatching a worker.
         # Release the slot we reserved — the gate path doesn't run an agent.
-        state_cfg = self.cfg.states.get(state_name) if state_name else None
+        state_cfg = self._states_for(issue).get(state_name) if state_name else None
         if state_cfg and state_cfg.type == "gate":
             self._release_slot(issue.id)
             asyncio.create_task(self._safe_enter_gate(issue, state_name))
@@ -978,14 +1148,14 @@ class Orchestrator:
             if not attempt.state_name:
                 state_name, run = await self._resolve_current_state(issue)
                 attempt.state_name = state_name
-                state_cfg = self.cfg.states.get(state_name)
+                state_cfg = self._states_for(issue).get(state_name)
                 if state_cfg and state_cfg.type == "gate":
                     # Issue should be at a gate, not running
                     await self._enter_gate(issue, state_name)
                     return
 
             state_name = attempt.state_name
-            state_cfg = self.cfg.states.get(state_name) if state_name else None
+            state_cfg = self._states_for(issue).get(state_name) if state_name else None
 
             claude_cfg = self.cfg.claude
             hooks_cfg = self.cfg.hooks
@@ -1002,6 +1172,13 @@ class Orchestrator:
             ws_root = self.cfg.workspace.resolved_root()
             ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
+
+            # Evidence directory, created fresh each turn and excluded from git
+            # locally so agent screenshots can never reach the project repo.
+            artifact_path = artifacts_mod.prepare(ws.path)
+            # A stale report from a previous stage would otherwise be re-posted
+            # verbatim as if it described this one.
+            report_mod.discard(ws.path)
 
             # Move issue from Todo to In Progress if needed
             todo_state = self.cfg.linear_states.todo
@@ -1028,13 +1205,8 @@ class Orchestrator:
             # Post state tracking comment (only for first dispatch of a state)
             if state_name:
                 run = self._issue_state_runs.get(issue.id, 1)
-                if run == 1 and (attempt.attempt is None or attempt.attempt == 0):
-                    client = self._ensure_linear_client()
-                    comment = make_state_comment(
-                        state=state_name,
-                        run=run,
-                    )
-                    await client.post_comment(issue.id, comment)
+                if attempt.attempt is None or attempt.attempt == 0:
+                    await self._announce_state(issue, state_name, run)
 
             # Run on_stage_enter hook if defined
             if state_cfg and state_cfg.hooks and state_cfg.hooks.on_stage_enter:
@@ -1055,6 +1227,10 @@ class Orchestrator:
 
             # Build env vars for the agent subprocess from workflow.yaml config
             agent_env = self.cfg.agent_env()
+            agent_env["STOKOWSKI_ARTIFACTS"] = str(artifact_path)
+            agent_env["STOKOWSKI_ISSUE"] = issue.identifier
+            if state_name:
+                agent_env["STOKOWSKI_STATE"] = state_name
 
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
@@ -1136,6 +1312,8 @@ class Orchestrator:
                     if attempt.status != "succeeded":
                         break
 
+            await self._publish_run_report(issue, attempt, ws.path, state_name)
+
             self._on_worker_exit(issue, attempt)
 
         except asyncio.CancelledError:
@@ -1152,8 +1330,9 @@ class Orchestrator:
         self, issue: Issue, attempt_num: int | None, state_name: str | None = None
     ) -> str:
         """Render prompt using state machine prompt assembly (async — fetches comments)."""
-        if state_name and state_name in self.cfg.states:
-            state_cfg = self.cfg.states[state_name]
+        states = self._states_for(issue)
+        if state_name and state_name in states:
+            state_cfg = states[state_name]
             run = self._issue_state_runs.get(issue.id, 1)
             last_completed = self._last_completed_at.get(issue.id)
             last_run_at = last_completed.isoformat() if last_completed else None
@@ -1177,6 +1356,7 @@ class Orchestrator:
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=comments,
+                global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
             )
 
         # Legacy fallback
@@ -1189,8 +1369,9 @@ class Orchestrator:
         assert self.workflow is not None
 
         # State machine mode: call assemble_prompt without comments
-        if state_name and state_name in self.cfg.states:
-            state_cfg = self.cfg.states[state_name]
+        states = self._states_for(issue)
+        if state_name and state_name in states:
+            state_cfg = states[state_name]
             run = self._issue_state_runs.get(issue.id, 1)
             last_completed = self._last_completed_at.get(issue.id)
             last_run_at = last_completed.isoformat() if last_completed else None
@@ -1206,6 +1387,7 @@ class Orchestrator:
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=None,
+                global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
             )
 
         # Legacy mode: use workflow prompt_template with Jinja2
@@ -1244,6 +1426,158 @@ class Orchestrator:
         except TemplateSyntaxError as e:
             raise RuntimeError(f"Template syntax error: {e}")
 
+    async def _publish_run_report(
+        self,
+        issue: Issue,
+        attempt: RunAttempt,
+        workspace_path: Path,
+        state_name: str | None,
+    ) -> None:
+        """Upload evidence, post the run report, and apply the classification label.
+
+        Runs after every agent turn, including failed ones — a run that fell
+        over having captured three screenshots is exactly when you want to see
+        them. Nothing here is allowed to break the run: a Linear outage should
+        cost you the report, not the work.
+        """
+        if attempt.status == "canceled":
+            return
+
+        try:
+            client = self._ensure_linear_client()
+        except Exception as e:
+            logger.warning(f"No Linear client for report: {e}", extra={"linked_to": issue.identifier})
+            return
+
+        state = state_name or attempt.state_name or "run"
+        run = self._issue_state_runs.get(issue.id, 1)
+
+        # ── Evidence ────────────────────────────────────────────────────────
+        uploaded: dict[str, str] = {}
+        try:
+            files = artifacts_mod.collect(workspace_path)
+        except Exception as e:
+            logger.warning(f"Artifact sweep failed: {e}", extra={"linked_to": issue.identifier})
+            files = []
+
+        for path in files:
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                logger.warning(f"Could not read artifact {path}: {e}", extra={"linked_to": issue.identifier})
+                continue
+            url = await client.upload_file(
+                path.name, artifacts_mod.content_type_for(path), data
+            )
+            if url:
+                uploaded[path.name] = url
+                attempt.artifacts.append(path.name)
+
+        if files and not uploaded:
+            logger.warning(
+                f"{len(files)} artifact(s) found but none uploaded",
+                extra={"linked_to": issue.identifier},
+            )
+
+        # ── Report ──────────────────────────────────────────────────────────
+        try:
+            report = report_mod.load(workspace_path, attempt.result_text)
+        except Exception as e:
+            logger.warning(f"Could not load report: {e}", extra={"linked_to": issue.identifier})
+            report = None
+
+        if report is None and not uploaded and attempt.status != "succeeded":
+            # A run that failed with nothing to show gets the normal retry
+            # machinery rather than a comment saying so on every attempt.
+            return
+
+        body = report_mod.render(
+            report,
+            state=state,
+            run=run,
+            uploaded=uploaded,
+            usage={
+                "total_tokens": attempt.total_tokens,
+                "cost_usd": attempt.cost_usd,
+                "tool_calls": attempt.tool_call_count,
+            },
+            fallback_text=attempt.result_text,
+        )
+
+        duration = None
+        if attempt.started_at:
+            duration = (datetime.now(timezone.utc) - attempt.started_at).total_seconds()
+        self.ledger.record_stage(
+            workflow=self._workflow_name_for(issue),
+            project=self.project_name or "",
+            issue_id=issue.id,
+            issue=issue.identifier,
+            title=issue.title,
+            state=state,
+            run=run,
+            status=attempt.status,
+            report=report,
+            tokens=attempt.total_tokens,
+            cost_usd=attempt.cost_usd,
+            tool_calls=attempt.tool_call_count,
+            tool_errors=attempt.tool_error_count,
+            artifacts=len(uploaded),
+            model=attempt.model,
+            duration_s=duration,
+        )
+
+        posted = await client.post_comment(issue.id, body)
+        if posted:
+            logger.info(
+                f"Posted {state} report ({len(uploaded)} artifacts)",
+                extra={"linked_to": issue.identifier},
+            )
+        else:
+            logger.warning("Failed to post run report", extra={"linked_to": issue.identifier})
+
+        # ── Classification label ────────────────────────────────────────────
+        await self._apply_classification_label(client, issue, report)
+
+        # Consume both so the next stage starts clean.
+        artifacts_mod.clear(workspace_path)
+        report_mod.discard(workspace_path)
+
+    async def _apply_classification_label(
+        self, client: LinearClient, issue: Issue, report: dict | None
+    ) -> None:
+        """Tag the issue with what the work was, and how sure the agent is.
+
+        Both are recorded in the ledger too; the labels are so a human can
+        filter the board without leaving Linear.
+        """
+        labels = report_mod.labels_for(report)
+        if not labels:
+            return
+
+        try:
+            team_id, existing_labels, on_issue = await client.fetch_team_labels(issue.id)
+        except Exception as e:
+            logger.warning(f"Could not read labels: {e}", extra={"linked_to": issue.identifier})
+            return
+
+        for name, colour in labels:
+            label_id = existing_labels.get(name.lower())
+
+            if label_id is None:
+                if not team_id:
+                    continue
+                label_id = await client.create_label(team_id, name, colour)
+                if not label_id:
+                    logger.warning(f"Could not create label '{name}'", extra={"linked_to": issue.identifier})
+                    continue
+
+            if label_id in on_issue:
+                continue
+
+            if await client.add_label(issue.id, label_id):
+                logger.info(f"Labelled {issue.identifier} '{name}'", extra={"linked_to": issue.identifier})
+
+
     def _on_child_pid(self, pid: int, is_register: bool):
         """Track child claude process PIDs for cleanup on shutdown."""
         if is_register:
@@ -1252,36 +1586,76 @@ class Orchestrator:
             self._child_pids.discard(pid)
 
     def _on_agent_event(self, identifier: str, event_type: str, event: dict):
-        """Callback for agent events — log notable activity to the log buffer."""
+        """Mirror notable agent activity into the log buffer.
+
+        Tool calls and text both arrive inside `assistant` events as content
+        blocks — there is no separate tool_use event type — so this walks the
+        blocks rather than switching on the top-level type.
+        """
         extra = {"linked_to": identifier}
-        if event_type == "tool_use":
-            tool_name = event.get("name", event.get("tool", ""))
-            logger.info(f"[{identifier}] tool: {tool_name}", extra=extra)
-        elif event_type == "assistant":
-            msg = event.get("message", {})
-            content = msg.get("content", "")
-            text = ""
+
+        if event_type == "assistant":
+            content = (event.get("message") or {}).get("content")
             if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
+                if content.strip():
+                    logger.info(f"[{identifier}] {content.strip()[:160]}", extra=extra)
+                return
+            if not isinstance(content, list):
+                return
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    name = block.get("name", "tool")
+                    detail = summarise_tool_input(name, block.get("input"))
+                    suffix = f" {detail}" if detail else ""
+                    logger.info(f"[{identifier}] {name}{suffix}", extra=extra)
+                elif block.get("type") == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        logger.info(f"[{identifier}] {text[:160]}", extra=extra)
+
+        elif event_type == "user":
+            # Only failures are worth a log line; successes are the norm.
+            content = (event.get("message") or {}).get("content")
+            if isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        break
-            if text:
-                logger.info(f"[{identifier}] {text[:120]}", extra=extra)
+                    if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                        logger.warning(f"[{identifier}] tool error", extra=extra)
+
+        elif event_type == "rate_limit_event":
+            info = event.get("rate_limit_info")
+            if isinstance(info, dict):
+                # Limits are account-wide, so the newest reading is the truth
+                # for every project this process is running.
+                self.rate_limit = {
+                    "status": info.get("status"),
+                    "type": info.get("rateLimitType"),
+                    "resets_at": info.get("resetsAt"),
+                    "overage_status": info.get("overageStatus"),
+                    "using_overage": info.get("isUsingOverage"),
+                }
+                if info.get("status") and info.get("status") != "allowed":
+                    logger.warning(
+                        f"[{identifier}] rate limit {info.get('status')} "
+                        f"({info.get('rateLimitType')})",
+                        extra=extra,
+                    )
+
         elif event_type == "result":
             result_text = event.get("result", "")
             if isinstance(result_text, str) and result_text:
-                logger.info(f"[{identifier}] result: {result_text[:120]}", extra=extra)
-        else:
-            logger.debug(f"Agent event issue={identifier} type={event_type}", extra=extra)
+                logger.info(f"[{identifier}] result: {result_text[:160]}", extra=extra)
 
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
         """Handle worker completion."""
         self.total_input_tokens += attempt.input_tokens
         self.total_output_tokens += attempt.output_tokens
+        self.total_cache_creation_tokens += attempt.cache_creation_tokens
+        self.total_cache_read_tokens += attempt.cache_read_tokens
         self.total_tokens += attempt.total_tokens
+        self.total_cost_usd += attempt.cost_usd
+        self.total_tool_calls += attempt.tool_call_count
         if attempt.started_at:
             elapsed = (datetime.now(timezone.utc) - attempt.started_at).total_seconds()
             self.total_seconds_running += elapsed
@@ -1299,7 +1673,7 @@ class Orchestrator:
         self._release_slot(issue.id)
 
         if attempt.status == "succeeded":
-            if attempt.state_name and attempt.state_name in self.cfg.states:
+            if attempt.state_name and attempt.state_name in self._states_for(issue):
                 # State machine mode: transition via "complete"
                 asyncio.create_task(self._safe_transition(issue, "complete"))
             else:
@@ -1486,6 +1860,7 @@ class Orchestrator:
                 # Clean up state caches so stale entries don't accumulate
                 self._issue_current_state.pop(issue_id, None)
                 self._issue_state_runs.pop(issue_id, None)
+                self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
                 self._pending_gates.pop(issue_id, None)
                 self._last_session_ids.pop(issue_id, None)
 
@@ -1523,6 +1898,18 @@ class Orchestrator:
         )
         project_name = self.project_name or ""
 
+        # Totals are banked when a worker exits, so in-flight agents must be
+        # added on top — otherwise the dashboard reads zero cost for the whole
+        # of a long run and only jumps at the end.
+        live = self.running.values()
+        live_input = sum(r.input_tokens for r in live)
+        live_output = sum(r.output_tokens for r in live)
+        live_cache_creation = sum(r.cache_creation_tokens for r in live)
+        live_cache_read = sum(r.cache_read_tokens for r in live)
+        live_total = sum(r.total_tokens for r in live)
+        live_cost = sum(r.cost_usd for r in live)
+        live_tools = sum(r.tool_call_count for r in live)
+
         return {
             "generated_at": now.isoformat(),
             "project_name": project_name,
@@ -1550,9 +1937,23 @@ class Orchestrator:
                     "tokens": {
                         "input_tokens": r.input_tokens,
                         "output_tokens": r.output_tokens,
+                        "cache_creation_tokens": r.cache_creation_tokens,
+                        "cache_read_tokens": r.cache_read_tokens,
                         "total_tokens": r.total_tokens,
                     },
+                    "cost_usd": round(r.cost_usd, 4),
+                    "model": r.model,
                     "state_name": r.state_name,
+                    "tool_call_count": r.tool_call_count,
+                    "tool_error_count": r.tool_error_count,
+                    "tool_counts": dict(r.tool_counts),
+                    "agent_turns": r.agent_turns,
+                    "compaction_count": r.compaction_count,
+                    "permission_denials": r.permission_denials,
+                    "artifact_count": len(r.artifacts),
+                    # The dashboard renders a timeline from this; cap the wire
+                    # payload so a long-running agent cannot bloat every poll.
+                    "activity": [e.to_dict() for e in list(r.activity)[-40:]],
                 }
                 for r in self.running.values()
             ],
@@ -1579,10 +1980,15 @@ class Orchestrator:
             "queued": [
                 {**q, "project_name": project_name} for q in self._queued
             ],
+            "rate_limit": self.rate_limit,
             "totals": {
-                "input_tokens": self.total_input_tokens,
-                "output_tokens": self.total_output_tokens,
-                "total_tokens": self.total_tokens,
+                "input_tokens": self.total_input_tokens + live_input,
+                "output_tokens": self.total_output_tokens + live_output,
+                "cache_creation_tokens": self.total_cache_creation_tokens + live_cache_creation,
+                "cache_read_tokens": self.total_cache_read_tokens + live_cache_read,
+                "total_tokens": self.total_tokens + live_total,
+                "cost_usd": round(self.total_cost_usd + live_cost, 4),
+                "tool_calls": self.total_tool_calls + live_tools,
                 "seconds_running": round(
                     self.total_seconds_running + active_seconds, 1
                 ),
@@ -1755,8 +2161,13 @@ class MultiOrchestrator:
         queued: list[dict] = []
         total_input = 0
         total_output = 0
+        total_cache_creation = 0
+        total_cache_read = 0
         total_tokens = 0
+        total_cost = 0.0
+        total_tools = 0
         total_seconds = 0.0
+        rate_limit: dict[str, Any] | None = None
         for name, orch in self.orchestrators.items():
             snap = orch.get_state_snapshot()
             per_project.append({
@@ -1771,8 +2182,15 @@ class MultiOrchestrator:
             queued.extend(snap["queued"])
             total_input += snap["totals"]["input_tokens"]
             total_output += snap["totals"]["output_tokens"]
+            total_cache_creation += snap["totals"]["cache_creation_tokens"]
+            total_cache_read += snap["totals"]["cache_read_tokens"]
             total_tokens += snap["totals"]["total_tokens"]
+            total_cost += snap["totals"]["cost_usd"]
+            total_tools += snap["totals"]["tool_calls"]
             total_seconds += snap["totals"]["seconds_running"]
+            # Rate limits are per-account, not per-project — any project's
+            # reading describes the same shared window.
+            rate_limit = snap.get("rate_limit") or rate_limit
         return {
             "generated_at": now.isoformat(),
             "projects": per_project,
@@ -1788,10 +2206,15 @@ class MultiOrchestrator:
             "retrying": retrying,
             "gates": gates,
             "queued": queued,
+            "rate_limit": rate_limit,
             "totals": {
                 "input_tokens": total_input,
                 "output_tokens": total_output,
+                "cache_creation_tokens": total_cache_creation,
+                "cache_read_tokens": total_cache_read,
                 "total_tokens": total_tokens,
+                "cost_usd": round(total_cost, 4),
+                "tool_calls": total_tools,
                 "seconds_running": round(total_seconds, 1),
             },
         }

@@ -8,9 +8,11 @@ from stokowski.config import (
     ClaudeConfig,
     HooksConfig,
     ProjectConfig,
+    RoutingConfig,
     ServiceConfig,
     StateConfig,
     TrackerConfig,
+    WorkflowSpec,
     merge_state_config,
     parse_workflow_file,
     validate_config,
@@ -122,6 +124,9 @@ class CodexReasoningConfigTests(unittest.TestCase):
     def test_workflow_parses_per_state_model_and_reasoning(self):
         with TemporaryDirectory() as directory:
             workflow_path = Path(directory) / "workflow.yaml"
+            prompt_path = Path(directory) / "prompts" / "investigate.md"
+            prompt_path.parent.mkdir()
+            prompt_path.write_text("Investigate the issue.")
             workflow_path.write_text(
                 """
 tracker:
@@ -143,17 +148,17 @@ states:
 
             workflow = parse_workflow_file(workflow_path)
 
-        state = workflow.config.states["investigate"]
-        self.assertEqual(state.model, "example-codex-model")
-        self.assertEqual(state.reasoning_effort, "high")
-        self.assertEqual(validate_config(workflow.config), [])
+            state = workflow.config.states["investigate"]
+            self.assertEqual(state.model, "example-codex-model")
+            self.assertEqual(state.reasoning_effort, "high")
+            self.assertEqual(validate_config(workflow.config), [])
 
     def test_validation_rejects_unknown_reasoning_effort(self):
         errors = validate_config(
             self.service_config(
                 StateConfig(
                     name="work",
-                    prompt="prompts/work.md",
+                    prompt="test_codex_runner.py",
                     runner="codex",
                     reasoning_effort="extreme",
                     transitions={"complete": "done"},
@@ -172,7 +177,7 @@ states:
             self.service_config(
                 StateConfig(
                     name="work",
-                    prompt="prompts/work.md",
+                    prompt="test_codex_runner.py",
                     runner="claude",
                     reasoning_effort="high",
                     transitions={"complete": "done"},
@@ -198,17 +203,21 @@ states:
 
     @staticmethod
     def service_config(state: StateConfig) -> ServiceConfig:
+        states = {
+            "work": state,
+            "done": StateConfig(
+                name="done",
+                type="terminal",
+                linear_state="terminal",
+            ),
+        }
         project = ProjectConfig(
             name="example",
             tracker=TrackerConfig(api_key="lin_api_test", project_slug="abc123"),
-            states={
-                "work": state,
-                "done": StateConfig(
-                    name="done",
-                    type="terminal",
-                    linear_state="terminal",
-                ),
-            },
+            states=states,
+            workflows={"default": WorkflowSpec(name="default", states=states)},
+            routing=RoutingConfig(default="default"),
+            workflow_dir=Path(__file__).parent,
         )
         return ServiceConfig(projects=[project])
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -409,6 +410,117 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     white-space: nowrap;
     flex-shrink: 0;
   }
+
+  .agent-card { cursor: pointer; }
+
+  .agent-card.expanded { background: #131313; }
+
+  .agent-sub {
+    font-size: 0.7rem;
+    color: var(--dim);
+    font-weight: 300;
+    margin-top: 3px;
+  }
+
+  .agent-cost {
+    font-size: 0.7rem;
+    color: var(--muted);
+    font-weight: 300;
+  }
+
+  .agent-warn { color: var(--red); }
+
+  /* Timeline — the per-agent activity trail, revealed on click. */
+  .timeline {
+    grid-column: 1 / -1;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  .tl-row {
+    display: grid;
+    grid-template-columns: 62px 118px minmax(0, 1fr);
+    gap: 12px;
+    padding: 3px 0;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    border-left: 2px solid transparent;
+    padding-left: 10px;
+  }
+
+  .tl-row.tool        { border-left-color: var(--blue); }
+  .tl-row.tool_result { border-left-color: var(--red); }
+  .tl-row.text        { border-left-color: var(--amber-dim); }
+  .tl-row.thinking    { border-left-color: var(--border-hi); }
+  .tl-row.result      { border-left-color: var(--green); }
+  .tl-row.rate_limit,
+  .tl-row.warning     { border-left-color: var(--red); }
+
+  .tl-time  { color: var(--dim); }
+  .tl-label {
+    color: var(--text);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tl-row.thinking .tl-label { color: var(--dim); font-weight: 300; font-style: italic; }
+  .tl-detail {
+    color: var(--muted);
+    font-weight: 300;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tl-row.tool_result .tl-detail,
+  .tl-row.warning .tl-detail { color: var(--red); }
+
+  .tl-empty { color: var(--dim); font-size: 0.72rem; font-weight: 300; }
+
+  .tl-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .tl-chip {
+    font-size: 0.62rem;
+    color: var(--muted);
+    border: 1px solid var(--border-hi);
+    border-radius: 2px;
+    padding: 1px 6px;
+    font-weight: 300;
+  }
+
+  .rl-chip {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 2px;
+    border: 1px solid var(--border-hi);
+    color: var(--dim);
+    font-weight: 400;
+  }
+  .rl-chip.warn { color: var(--red); border-color: rgba(217,95,82,.4); }
+
+  .wf-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+            padding:14px 24px; background:var(--surface);
+            border:1px solid var(--border); margin-bottom:20px; }
+  .wf-tab { padding:5px 12px; border:1px solid var(--border-hi); border-radius:2px;
+            font-size:.72rem; color:var(--muted); cursor:pointer; background:none;
+            font-family:var(--font); }
+  .wf-tab:hover { color:var(--text); }
+  .wf-tab.on { color:var(--amber); border-color:var(--amber); }
+  .wf-tab .wf-def { font-size:.55rem; color:var(--dim); margin-left:6px;
+                    text-transform:uppercase; letter-spacing:.08em; }
+  .wf-routes { font-size:.65rem; color:var(--dim); margin-left:auto; text-align:right;
+               line-height:1.7; }
+  .wf-routes code { color:var(--muted); }
 
   .agent-meta {
     text-align: right;
@@ -834,6 +946,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="logo-tag">Claude Code Orchestrator</span>
     </div>
     <div class="header-right">
+      <a href="/studio" class="rl-chip" style="text-decoration:none">workflow &rarr;</a>
+      <span id="rate-limit" class="rl-chip" style="display:none">—</span>
       <div id="status-dot" class="status-dot idle"></div>
       <span id="ts" class="timestamp">—</span>
     </div>
@@ -900,6 +1014,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="stat-item">
       <span class="stat-label">Out</span>
       <span class="stat-value" id="s-out">—</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat-item">
+      <span class="stat-label">Cache r/w</span>
+      <span class="stat-value" id="s-cache">—</span>
     </div>
     <div class="stat-divider"></div>
     <div id="progress-container" style="display:none; flex:1; align-items:center; gap:12px;">
@@ -1070,6 +1189,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }).join('') + `</div>`;
   }
 
+  // Which agent cards are expanded. Kept outside the render so a card stays
+  // open across the 3s poll.
+  const expandedAgents = new Set();
+
+  window.__toggleAgent = function (key) {
+    if (expandedAgents.has(key)) expandedAgents.delete(key);
+    else expandedAgents.add(key);
+    if (window.__lastData) renderAgents(window.__lastData);
+  };
+
+  function renderTimeline(r) {
+    const acts = r.activity || [];
+    const counts = r.tool_counts || {};
+    const chips = Object.keys(counts)
+      .sort((a, b) => counts[b] - counts[a])
+      .map(k => `<span class="tl-chip">${esc(k)} ${counts[k]}</span>`)
+      .join('');
+
+    if (!acts.length) {
+      return `<div class="timeline">${chips ? `<div class="tl-tools">${chips}</div>` : ''}<div class="tl-empty">No activity recorded yet</div></div>`;
+    }
+
+    // Newest last, matching the order the agent did the work.
+    const rows = acts.map(a => {
+      const t = a.at ? new Date(a.at).toLocaleTimeString('en-GB', { hour12: false }) : '';
+      const mark = a.status === 'error' ? '\u2717 ' : (a.status === 'warn' ? '\u26a0 ' : '');
+      return `<div class="tl-row ${esc(a.kind)}">
+        <span class="tl-time">${esc(t)}</span>
+        <span class="tl-label" title="${esc(a.label)}">${mark}${esc(a.label)}</span>
+        <span class="tl-detail" title="${esc(a.detail || '')}">${esc(a.detail || '')}</span>
+      </div>`;
+    }).join('');
+
+    return `<div class="timeline">${chips ? `<div class="tl-tools">${chips}</div>` : ''}${rows}</div>`;
+  }
+
   function renderAgents(data) {
     const all = [
       ...(data.running || []),
@@ -1108,8 +1263,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const rows = all.map(r => {
       const stateInfo = r.state_name ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">${esc(r.state_name)}</span>` : '';
       const projTag = r.project_name ? `<div class="agent-project">${esc(r.project_name)}</div>` : '';
+      const key = (r.project_name || '') + '/' + r.issue_identifier;
+      const open = expandedAgents.has(key);
+
+      // Tool count and error count give an at-a-glance sense of whether the
+      // agent is making progress or thrashing.
+      const toolBits = [];
+      if (r.tool_call_count) toolBits.push(`${r.tool_call_count} tools`);
+      if (r.tool_error_count) toolBits.push(`<span class="agent-warn">${r.tool_error_count} err</span>`);
+      if (r.compaction_count) toolBits.push(`${r.compaction_count}\u00d7 compact`);
+      if (r.artifact_count) toolBits.push(`${r.artifact_count} artifacts`);
+      const sub = toolBits.length ? `<div class="agent-sub">${toolBits.join(' \u00b7 ')}</div>` : '';
+      const cost = r.cost_usd ? `<div class="agent-cost">$${r.cost_usd.toFixed(2)}</div>` : '';
+
       return `
-      <div class="agent-card">
+      <div class="agent-card ${open ? 'expanded' : ''}" onclick="window.__toggleAgent('${esc(key)}')">
         <div>
           <div class="agent-id">${esc(r.issue_identifier)}</div>
           ${projTag}
@@ -1119,14 +1287,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ${statusPill(r.status)}${stateInfo}
           </div>
           <div class="agent-activity">
-            <span class="agent-msg">${esc(r.last_message || '—')}</span>
+            <span class="agent-msg">${esc(r.last_message || '\u2014')}</span>
             ${r.last_event_at ? `<span class="agent-elapsed">${fmtElapsed(r.last_event_at)}</span>` : ''}
           </div>
+          ${sub}
         </div>
         <div class="agent-meta">
           <div class="agent-tokens">${fmt(r.tokens?.total_tokens || 0)} tok</div>
           <div class="agent-turns">turn ${r.turn_count || 0}</div>
+          ${cost}
         </div>
+        ${open ? renderTimeline(r) : ''}
       </div>`;
     }).join('');
 
@@ -1138,6 +1309,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     try {
       const res = await fetch('/api/v1/state');
       const data = await res.json();
+      window.__lastData = data;
 
       const running  = data.counts?.running  || 0;
       const retrying = data.counts?.retrying || 0;
@@ -1150,12 +1322,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('v-tokens').textContent   = fmt(data.totals?.total_tokens || 0);
       document.getElementById('v-runtime').textContent  = fmtSecs(data.totals?.seconds_running || 0);
 
+      // Cost is the number that actually tells you what a run was worth, so it
+      // rides alongside the token count rather than being buried.
+      const cost = data.totals?.cost_usd || 0;
+      const toolCalls = data.totals?.tool_calls || 0;
+      document.getElementById('v-tokens-sub').textContent =
+        '$' + cost.toFixed(2) + (toolCalls ? ' \u00b7 ' + fmt(toolCalls) + ' tool calls' : '');
+
       document.getElementById('m-running').className  = 'metric' + (active ? ' active' : '');
       document.getElementById('m-tokens').className   = 'metric' + (data.totals?.total_tokens > 0 ? ' active' : '');
 
-      // Stats bar
+      // Stats bar. Cache reads are shown separately because they typically
+      // dwarf fresh input and are billed at a tenth of the rate — collapsing
+      // them into one figure hides where the spend actually goes.
       document.getElementById('s-in').textContent  = fmt(data.totals?.input_tokens  || 0);
       document.getElementById('s-out').textContent = fmt(data.totals?.output_tokens || 0);
+      const sCache = document.getElementById('s-cache');
+      if (sCache) {
+        const cw = data.totals?.cache_creation_tokens || 0;
+        const cr = data.totals?.cache_read_tokens || 0;
+        sCache.textContent = fmt(cr) + ' / ' + fmt(cw);
+      }
+
+      // Rate-limit window
+      const rl = data.rate_limit;
+      const rlEl = document.getElementById('rate-limit');
+      if (rl && rl.status) {
+        const ok = rl.status === 'allowed';
+        let label = (rl.type || 'limit').replace('_', '-') + ' ' + rl.status;
+        if (rl.resets_at) {
+          const mins = Math.max(0, Math.round((rl.resets_at * 1000 - Date.now()) / 60000));
+          label += mins > 90 ? ' \u00b7 ' + Math.round(mins / 60) + 'h' : ' \u00b7 ' + mins + 'm';
+        }
+        rlEl.textContent = label;
+        rlEl.className = 'rl-chip' + (ok ? '' : ' warn');
+        rlEl.style.display = '';
+      } else {
+        rlEl.style.display = 'none';
+      }
 
       // Progress bar
       const pc = document.getElementById('progress-container');
@@ -1304,6 +1508,372 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
+
+# ── Studio page ──────────────────────────────────────────────────────────────
+# Same shell and palette as the dashboard, no build step, no dependencies —
+# the config file remains the source of truth and this is a view onto it.
+
+STUDIO_HTML = DASHBOARD_HTML.split("<body>")[0] + """<body>
+<div class="shell">
+  <div class="header">
+    <div class="logo">
+      <span class="logo-mark">STOKOWSKI</span>
+      <span class="logo-sub">WORKFLOW STUDIO</span>
+    </div>
+    <div class="header-right">
+      <a href="/" class="rl-chip" style="text-decoration:none">&larr; dashboard</a>
+      <span id="wf-path" class="timestamp">—</span>
+    </div>
+  </div>
+
+  <div id="banner" style="display:none"></div>
+
+  <div id="workflow-bar"></div>
+
+  <div class="section-header">
+    <span class="section-title">PIPELINE</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="stage-count">0</span>
+  </div>
+  <div id="pipeline"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">STAGES</span>
+    <div class="section-line"></div>
+  </div>
+  <div id="action-bar"></div>
+  <div id="stages"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">GLOBAL</span>
+    <div class="section-line"></div>
+  </div>
+  <div id="root-fields" class="agents"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">PROMPTS</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="prompt-count">0</span>
+  </div>
+  <div id="prompts"></div>
+
+  <div class="footer">
+    <span>Edits are validated before they are written &mdash; an invalid config is never saved</span>
+    <span class="footer-right" id="saved">—</span>
+  </div>
+</div>
+
+<style>
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:18px 24px;
+          background:var(--surface); border:1px solid var(--border); margin-bottom:28px; }
+  .node { padding:6px 12px; border:1px solid var(--border-hi); border-radius:2px;
+          font-size:.75rem; white-space:nowrap; }
+  .node.agent    { color:var(--text);  border-color:var(--blue); }
+  .node.gate     { color:var(--amber); border-color:var(--amber-dim); }
+  .node.terminal { color:var(--green); border-color:rgba(76,186,110,.4); }
+  .node-sub { display:block; font-size:.6rem; color:var(--dim); margin-top:2px; }
+  .arrow { color:var(--dim); font-size:.8rem; }
+
+  .stage { background:var(--surface); border:1px solid var(--border); margin-bottom:1px;
+           padding:16px 24px; }
+  .stage-head { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
+  .stage-name { color:var(--amber); font-weight:600; font-size:.85rem; }
+  .stage-kind { font-size:.6rem; text-transform:uppercase; letter-spacing:.1em;
+                color:var(--dim); border:1px solid var(--border-hi); padding:1px 6px; }
+  .stage-flow { font-size:.7rem; color:var(--dim); margin-left:auto; }
+
+  .fields { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
+  .field label { display:block; font-size:.6rem; text-transform:uppercase;
+                 letter-spacing:.08em; color:var(--dim); margin-bottom:4px; }
+  .field input, .field select {
+    width:100%; background:var(--bg); color:var(--text); font-family:var(--font);
+    font-size:.75rem; border:1px solid var(--border-hi); border-radius:2px; padding:5px 7px; }
+  .field input:focus, .field select:focus { outline:none; border-color:var(--amber); }
+  .field.dirty input, .field.dirty select { border-color:var(--amber); }
+  .field .inherited { font-size:.55rem; color:var(--dim); margin-top:3px; }
+
+  .bar { display:flex; gap:10px; align-items:center; padding:14px 24px;
+         background:var(--surface); border:1px solid var(--border); margin-bottom:28px; }
+  button.act { background:var(--amber); color:#111; border:none; border-radius:2px;
+               padding:6px 14px; font-family:var(--font); font-size:.7rem; font-weight:600;
+               cursor:pointer; }
+  button.act[disabled] { background:var(--border-hi); color:var(--dim); cursor:default; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--border-hi); }
+
+  .banner { padding:12px 24px; margin-bottom:20px; font-size:.75rem; border:1px solid; }
+  .banner.err { color:var(--red); border-color:rgba(217,95,82,.4); background:rgba(217,95,82,.07); }
+  .banner.ok  { color:var(--green); border-color:rgba(76,186,110,.4); background:rgba(76,186,110,.07); }
+
+  .prompt-row { display:flex; align-items:center; gap:12px; padding:10px 24px;
+                background:var(--surface); border:1px solid var(--border); margin-bottom:1px;
+                cursor:pointer; font-size:.75rem; }
+  .prompt-row:hover { background:#141414; }
+  .prompt-row .p-name { color:var(--text); }
+  .prompt-row .p-size { margin-left:auto; color:var(--dim); font-size:.65rem; }
+  .editor { width:100%; min-height:420px; background:var(--bg); color:var(--text);
+            font-family:var(--font); font-size:.75rem; line-height:1.6; padding:14px;
+            border:1px solid var(--border-hi); border-radius:2px; resize:vertical; }
+</style>
+
+<script>
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  let DATA = null;
+  const pending = new Map();   // key -> update object
+
+  function banner(msg, kind) {
+    const el = document.getElementById('banner');
+    if (!msg) { el.style.display = 'none'; return; }
+    el.className = 'banner ' + kind;
+    el.textContent = msg;
+    el.style.display = '';
+    if (kind === 'ok') setTimeout(() => { el.style.display = 'none'; }, 4000);
+  }
+
+  // ── Pipeline strip: the "what does this actually do" view ───────────────
+  function renderFlow(d) {
+    const order = [];
+    const seen = new Set();
+    let cur = d.entry_state;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur); order.push(cur);
+      const s = d.states.find(x => x.name === cur);
+      cur = s && (s.transitions.complete || s.transitions.approve);
+    }
+    // Anything unreachable still deserves showing — silently hiding a state
+    // is how an orphaned stage goes unnoticed.
+    d.states.forEach(s => { if (!seen.has(s.name)) order.push(s.name); });
+
+    document.getElementById('stage-count').textContent = d.states.length;
+    document.getElementById('pipeline').innerHTML = '<div class="flow">' +
+      order.map((name, i) => {
+        const s = d.states.find(x => x.name === name);
+        if (!s) return '';
+        const detail = s.type === 'agent'
+          ? [s.model, s.effort, s.session, s.runner].filter(Boolean).join(' · ')
+          : (s.type === 'gate' ? 'human · rework → ' + esc(s.rework_to || '?') : 'end');
+        const orphan = seen.has(name) ? '' : ' (unreachable)';
+        return (i ? '<span class="arrow">→</span>' : '') +
+          `<span class="node ${esc(s.type)}">${esc(name)}${orphan}
+             <span class="node-sub">${esc(detail)}</span></span>`;
+      }).join('') + '</div>';
+  }
+
+  function fieldHtml(scope, state, key, value, spec, inherited) {
+    const id = `${scope}:${state || ''}:${key}`;
+    const label = key.split('.').pop().replace(/_/g, ' ');
+    let control;
+    if (spec.type === 'model') {
+      // A real select, grouped by provider — a datalist only reveals its
+      // options once you start typing, which is not a dropdown. The catalogue
+      // will always lag real model lineups, so "Custom…" swaps the control for
+      // a text input rather than making an unlisted model unreachable.
+      const groups = (DATA && DATA.model_catalogue) || [];
+      const known = groups.some(g => g.models.includes(value));
+      const opts = groups.map(g =>
+        `<optgroup label="${esc(g.label)}">` +
+        g.models.map(m =>
+          `<option value="${esc(m)}"${m === value ? ' selected' : ''}>${esc(m)}</option>`
+        ).join('') + `</optgroup>`
+      ).join('');
+      control = `<select data-id="${esc(id)}" onchange="window.__modelChanged(this)">
+          <option value=""${value ? '' : ' selected'}>${esc(inherited ? 'inherit — ' + inherited : '—')}</option>
+          ${opts}
+          <option value="__custom__">Custom…</option>
+        </select>`;
+      if (value && !known) {
+        // A model already in the config but outside the catalogue is shown as
+        // text so it is visible and editable rather than silently dropped.
+        control = `<input data-id="${esc(id)}" value="${esc(value)}"
+                     placeholder="${esc(inherited ?? '')}">`;
+      }
+    } else if (spec.choices) {
+      control = `<select data-id="${esc(id)}">` +
+        ['', ...spec.choices].map(c =>
+          `<option value="${esc(c)}"${String(value ?? '') === c ? ' selected' : ''}>${esc(c || '—')}</option>`
+        ).join('') + '</select>';
+    } else {
+      control = `<input data-id="${esc(id)}" value="${esc(value ?? '')}"
+                   placeholder="${esc(inherited ?? '')}">`;
+    }
+    const note = (value == null && inherited != null)
+      ? `<div class="inherited">inherits ${esc(inherited)}</div>` : '';
+    return `<div class="field" id="f-${esc(id)}"><label>${esc(label)}</label>${control}${note}</div>`;
+  }
+
+  function renderStages(d) {
+    document.getElementById('stages').innerHTML = d.states.map(s => {
+      const applicable = Object.entries(d.state_fields).filter(([k]) => {
+        if (s.type === 'gate') return ['rework_to', 'max_rework'].includes(k);
+        if (s.type === 'terminal') return false;
+        return !['rework_to', 'max_rework'].includes(k);
+      });
+      const fields = applicable.map(([k, spec]) =>
+        fieldHtml('state', s.name, k, s[k], spec,
+                  k === 'model' ? d.root['claude.model']
+                  : k === 'effort' ? (d.root['claude.effort'] || 'high (CLI default)')
+                  : null)
+      ).join('');
+      const flow = Object.entries(s.transitions)
+        .map(([t, target]) => `${esc(t)} → ${esc(target)}`).join('  ·  ');
+      const conc = s.concurrency != null ? ` · max ${s.concurrency} at once` : '';
+      return `<div class="stage">
+        <div class="stage-head">
+          <span class="stage-name">${esc(s.name)}</span>
+          <span class="stage-kind">${esc(s.type)}</span>
+          <span class="stage-flow">${flow}${esc(conc)}</span>
+        </div>
+        ${fields ? `<div class="fields">${fields}</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  function renderRoot(d) {
+    document.getElementById('root-fields').innerHTML =
+      '<div class="stage"><div class="fields">' +
+      Object.entries(d.root_fields).map(([k, spec]) =>
+        fieldHtml('root', null, k, d.root[k], spec, null)).join('') +
+      '</div></div>';
+  }
+
+  function renderWorkflows(d) {
+    const host = document.getElementById('workflow-bar');
+    if (!d.workflows || d.workflows.length < 2) { host.innerHTML = ''; return; }
+
+    const tabs = d.workflows.map(w =>
+      `<button class="wf-tab ${w === d.selected_workflow ? 'on' : ''}"
+               onclick="window.__selectWorkflow('${esc(w)}')">${esc(w)}${
+        w === (d.routing && d.routing.default) ? '<span class="wf-def">default</span>' : ''
+      }</button>`).join('');
+
+    // The routing table is the answer to "why did this ticket run that
+    // pipeline", so it belongs next to the pipeline itself.
+    const rules = ((d.routing && d.routing.rules) || [])
+      .map(r => `<code>${esc(r.label)}</code> &rarr; ${esc(r.workflow)}`).join('<br>');
+    const fallback = d.routing && d.routing.default
+      ? `<code>anything else</code> &rarr; ${esc(d.routing.default)}` : '';
+
+    host.innerHTML = `<div class="wf-bar">${tabs}
+      <div class="wf-routes">${rules}${rules && fallback ? '<br>' : ''}${fallback}</div>
+    </div>`;
+  }
+
+  window.__selectWorkflow = function (name) { load(name); };
+
+  // "Custom…" turns the dropdown into a free-text field, so a model newer than
+  // the catalogue is always reachable without shipping a release.
+  window.__modelChanged = function (select) {
+    if (select.value !== '__custom__') return;
+    const input = document.createElement('input');
+    input.dataset.id = select.dataset.id;
+    input.placeholder = 'model id';
+    select.replaceWith(input);
+    input.focus();
+  };
+
+  function renderPrompts(d) {
+    document.getElementById('prompt-count').textContent = d.prompts.length;
+    document.getElementById('prompts').innerHTML = d.prompts.map(p =>
+      `<div class="prompt-row" onclick="openPrompt('${esc(p.path)}')">
+         <span class="p-name">${esc(p.path)}</span>
+         <span class="p-size">${(p.bytes / 1024).toFixed(1)} KB</span>
+       </div>`).join('');
+  }
+
+  document.addEventListener('input', e => {
+    const id = e.target.dataset && e.target.dataset.id;
+    if (!id) return;
+    const [scope, state, ...rest] = id.split(':');
+    const field = rest.join(':');
+    pending.set(id, { scope, state: state || null, field, value: e.target.value });
+    const box = document.getElementById('f-' + id);
+    if (box) box.classList.add('dirty');
+    document.getElementById('save').disabled = false;
+    document.getElementById('save').textContent = `Save ${pending.size} change${pending.size > 1 ? 's' : ''}`;
+  });
+
+  async function save() {
+    const btn = document.getElementById('save');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const res = await fetch('/api/v1/studio/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          updates: [...pending.values()],
+          workflow: DATA && DATA.selected_workflow,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ? body.error.message : 'save failed');
+      const showing = DATA && DATA.selected_workflow;
+      pending.clear();
+      banner('Saved. Stokowski re-reads config on the next poll tick.', 'ok');
+      document.getElementById('saved').textContent =
+        'saved ' + new Date().toLocaleTimeString('en-GB', { hour12: false });
+      await load(showing);
+    } catch (err) {
+      // The config on disk is untouched when a save is rejected.
+      banner(String(err.message || err), 'err');
+      btn.disabled = false;
+      btn.textContent = `Save ${pending.size} change${pending.size > 1 ? 's' : ''}`;
+    }
+  }
+
+  window.openPrompt = async function (path) {
+    const res = await fetch('/api/v1/studio/prompt?path=' + encodeURIComponent(path));
+    const body = await res.json();
+    if (!res.ok) return banner(body.error.message, 'err');
+    const host = document.getElementById('prompts');
+    host.innerHTML = `
+      <div class="bar">
+        <strong style="font-size:.75rem">${esc(path)}</strong>
+        <span style="flex:1"></span>
+        <button class="act" onclick="savePrompt('${esc(path)}')">Save prompt</button>
+        <button class="act ghost" onclick="load()">Back</button>
+      </div>
+      <textarea class="editor" id="prompt-body"></textarea>`;
+    document.getElementById('prompt-body').value = body.body;
+  };
+
+  window.savePrompt = async function (path) {
+    const res = await fetch('/api/v1/studio/prompt', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, body: document.getElementById('prompt-body').value }),
+    });
+    const body = await res.json();
+    if (!res.ok) return banner(body.error.message, 'err');
+    banner('Prompt saved. It applies to the next run that uses it.', 'ok');
+  };
+
+  async function load(workflow) {
+    const url = '/api/v1/studio' + (workflow ? '?workflow=' + encodeURIComponent(workflow) : '');
+    const res = await fetch(url);
+    const d = await res.json();
+    if (!res.ok) return banner(d.error.message, 'err');
+    DATA = d;
+    pending.clear();
+    document.getElementById('wf-path').textContent = d.workflow_path;
+    renderWorkflows(d); renderFlow(d); renderStages(d); renderRoot(d); renderPrompts(d);
+    const scope = d.selected_workflow ? ` in <strong>${esc(d.selected_workflow)}</strong>` : '';
+    document.getElementById('action-bar').innerHTML = `<div class="bar">
+        <button class="act" id="save" disabled onclick="save()">No changes</button>
+        <button class="act ghost" onclick="load(DATA && DATA.selected_workflow)">Reload from disk</button>
+        <span style="color:var(--dim);font-size:.65rem">
+          Editing${scope}. Structural changes — adding states, rewiring
+          transitions — stay in the file.
+        </span>
+      </div>`;
+  }
+
+  window.save = save;
+  window.load = load;
+  load();
+</script>
+</body>
+</html>
+"""
+
 def create_app(orchestrator: "MultiOrchestrator") -> FastAPI:
     app = FastAPI(title="Stokowski", version="0.1.0")
 
@@ -1340,6 +1910,84 @@ def create_app(orchestrator: "MultiOrchestrator") -> FastAPI:
 
         return StreamingResponse(generate(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ── Studio: read and edit the workflow config ────────────────────────
+    #
+    # The config file stays the source of truth; this is a view onto it that
+    # can write back. Every write is validated before it lands (see
+    # studio.py), so the UI cannot leave the orchestrator unable to start.
+
+    def _studio() -> "Studio":
+        from .studio import Studio
+        return Studio(Path(orchestrator.workflow_path))
+
+    def _studio_error(e: Exception, status: int = 400) -> JSONResponse:
+        return JSONResponse(
+            {"error": {"code": "studio_error", "message": str(e)}},
+            status_code=status,
+        )
+
+    @app.get("/studio", response_class=HTMLResponse)
+    async def studio_page():
+        return HTMLResponse(STUDIO_HTML)
+
+    @app.get("/api/v1/studio")
+    async def api_studio(workflow: str | None = None):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().describe(workflow))
+        except (StudioError, OSError) as e:
+            return _studio_error(e, 500)
+
+    @app.post("/api/v1/studio/default-workflow")
+    async def api_studio_default_workflow(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().set_default_workflow(payload.get("workflow") or ""))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.get("/api/v1/studio/raw")
+    async def api_studio_raw():
+        try:
+            return JSONResponse({"text": _studio().raw()})
+        except OSError as e:
+            return _studio_error(e, 500)
+
+    @app.post("/api/v1/studio/raw")
+    async def api_studio_write_raw(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().write_raw(payload.get("text") or ""))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.post("/api/v1/studio/apply")
+    async def api_studio_apply(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().apply(
+                payload.get("updates") or [], workflow=payload.get("workflow")
+            ))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.get("/api/v1/studio/prompt")
+    async def api_studio_prompt(path: str):
+        from .studio import StudioError
+        try:
+            return JSONResponse({"path": path, "body": _studio().read_prompt(path)})
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.post("/api/v1/studio/prompt")
+    async def api_studio_write_prompt(payload: dict):
+        from .studio import StudioError
+        try:
+            _studio().write_prompt(payload.get("path") or "", payload.get("body") or "")
+            return JSONResponse({"ok": True})
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
 
     @app.get("/api/v1/{issue_identifier}")
     async def api_issue(issue_identifier: str):

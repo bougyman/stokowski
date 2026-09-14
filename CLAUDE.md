@@ -25,12 +25,19 @@ The agent prompt, runtime config, and workspace setup all live in `workflow.yaml
 
 ```
 stokowski/
+  artifacts.py     Agent evidence: collection, git isolation, cleanup
   config.py        workflow.yaml parser + typed config dataclasses
+  events.py        stream-json event parsing -> RunAttempt state
+  ledger.py        Append-only run log + approval-rate summary
   linear.py        Linear GraphQL client (httpx async)
+  model_catalogue.py  Known models by provider (data, for the studio dropdown)
   models.py        Domain models: Issue, RunAttempt, RetryEntry
+  # workflows/*.yaml alongside the config hold one pipeline each
   orchestrator.py  Main poll loop, dispatch, reconciliation, retry
-  prompt.py        Three-layer prompt assembly for state machine workflows
-  runner.py        Claude Code and Codex CLI integration, stream parser
+  prompt.py        Three-layer prompt assembly + the agent reporting contract
+  report.py        Structured run reports -> rendered Linear comments
+  studio.py        Comment-preserving config editing behind the dashboard
+  runner.py        Claude Code and Codex CLI integration, stream parsing, subprocess lifecycle
   tracking.py      State machine tracking via structured Linear comments
   workspace.py     Per-issue workspace lifecycle and hooks
   web.py           Optional FastAPI dashboard
@@ -59,6 +66,29 @@ Simpler operational story — single process, no BEAM runtime, no distributed co
 ### No persistent database
 All state lives in memory. The orchestrator recovers from restart by re-polling Linear and re-discovering active issues. Workspace directories on disk act as durable state.
 
+### Many workflows, one runtime
+A Linear label chooses which pipeline runs. `workflows/*.yaml` hold one state
+machine and one global prompt each; `workflow.yaml` keeps everything else —
+tracker, workspace, hooks, concurrency, server — because duplicating those per
+pipeline would mean three places to rotate an API key.
+
+Routing rules are evaluated in order, first match wins, with a `default` for
+unlabelled issues. The workflow is **pinned at first dispatch** and written into
+the tracking comment: relabelling a ticket mid-run must not move it onto a
+different state machine, and a restart recovers the pin from Linear rather than
+re-routing from labels that may have changed.
+
+This is what removes `if this is a bug…` branching from prompts. Each workflow's
+**global prompt** says once what kind of work this is, so a stage prompt shared
+by several workflows (`review.md`, `merge.md`) needs no conditional. Sharing is
+just two workflows naming the same path — there is no separate mechanism.
+
+`workflows/x.example.yaml` and `workflows/x.yaml` are both the workflow `x`; a
+real file shadows the shipped example, mirroring how prompts work.
+
+An inline `states:` block still works and is folded in as a workflow named
+`default`, so a single-pipeline config runs untouched.
+
 ### workflow.yaml as the operator contract
 The operator's `workflow.yaml` defines the runtime config and state machine. Stokowski re-parses it on every poll tick — config changes take effect without restart. Both `.yaml` and legacy `.md` (YAML front matter + Jinja2 body) formats are supported. Prompt templates are now separate `.md` files referenced by path from the config.
 
@@ -66,9 +96,27 @@ The operator's `workflow.yaml` defines the runtime config and state machine. Sto
 Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs the configured Claude or Codex runner), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
 
 **Three-layer prompt assembly:** Every agent turn's prompt is built from three layers concatenated together:
-1. **Global prompt** — shared context loaded from a `.md` file (referenced by `prompts.global_prompt`)
+1. **Global prompt** — shared context loaded from a `.md` file (referenced by `prompts.global_prompt`).
+   `global_prompt` also takes a **list** of paths, loaded in order, so a specialised
+   global supplements the shared one instead of replacing it. `global-bug-fix.md` used to
+   say "everything in `global.md` applies" in prose — a file nothing loaded, so every
+   bug-fix run shipped without the grounding and evidence rules it claimed to inherit.
+   `config.global_prompt_paths()` normalises either shape.
 2. **Stage prompt** — state-specific instructions loaded from the state's `prompt` path
 3. **Lifecycle injection** — auto-generated section with issue metadata, transitions, rework context, and recent comments
+
+**Grounding before gates:** The example pipeline puts an independent
+`ground-check` agent between `investigate` and the first human gate, running
+`session: fresh`. The failure it targets is an investigation that reasoned
+correctly from the wrong data — wrong environment, dead column, unreproducible
+number. That report is fluent, internally consistent and wrong, which is
+exactly why a human gate does not catch it: a reviewer reading prose cannot
+distinguish a well-sourced conclusion from a well-written one.
+
+The fresh session is load-bearing rather than cosmetic. A continued session
+inherits the assumptions it is supposed to be testing and will confirm them.
+`tests/test_example_prompts.py` asserts both properties, so a future edit that
+routes `investigate` straight to a gate fails the suite.
 
 **Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and posts a structured tracking comment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state.
 
@@ -94,8 +142,8 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `AgentConfig` — concurrency limits (global + per-state)
 - `ServerConfig` — optional web dashboard port
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
-- `PromptsConfig` — global prompt file reference
-- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, Codex reasoning effort, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+- `PromptsConfig` — global prompt file reference (a path, or a list of paths loaded in order)
+- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, Claude effort and fallback, Codex reasoning effort, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
 
 `ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
 
@@ -173,6 +221,103 @@ while running:
 
 Workspace key is the sanitized issue identifier: only `[A-Za-z0-9._-]` characters.
 
+### events.py
+Owns the mapping from stream-json onto `RunAttempt`. Split out of `runner.py`
+so the parsing is testable without launching a subprocess — the original bug
+class survived precisely because nothing could exercise it in isolation.
+
+`process_event()` folds one event in. Tool calls, thinking, text, tool errors,
+rate limits and results all append to `attempt.activity`, a bounded deque
+(`ACTIVITY_MAXLEN = 250`) that the dashboard renders as a timeline.
+
+Successful tool results are deliberately NOT recorded — a real run makes
+hundreds, and they carry no information. Only failures are.
+
+`display_tool_name()` shortens `mcp__playwright__browser_take_screenshot` to
+`playwright:browser_take_screenshot` so the argument stays visible.
+
+### artifacts.py
+Agent evidence (screenshots, exports) lives in `.stokowski/artifacts/` **inside**
+the workspace, not beside it. Playwright MCP and the simulator MCP refuse to
+write outside their working directory, so an external path silently produces
+nothing.
+
+Because it lives inside the clone it must be ignored, and the ignore goes in
+`.git/info/exclude` — never the project's `.gitignore`, which belongs to the
+project and would show up in every diff. `tests/test_artifacts.py` asserts
+against real `git status` output.
+
+`collect()` sorts by mtime so before/after pairs read in capture order, filters
+to known evidence types, and skips empty or oversized files.
+
+### report.py
+Stokowski renders the Linear comment; the agent supplies structured JSON at
+`.stokowski/report.json`. Authorship sits here because a model asked to
+summarise its own work reliably produces something readable and unreliably
+produces something checkable.
+
+The rendering is deliberately unflattering. A claim with no `evidence` or
+`source` is printed with a warning marker rather than dropped; an unverified
+`data_source` is marked as such; a missing report posts "no structured report"
+rather than silently falling back to prose. The point is that thin work should
+look thin on the issue.
+
+`classification` maps to a Linear label (`stokowski/bug-fix`,
+`stokowski/improvement`, `stokowski/prototype`, …), created on the team if
+absent. This is how the board gets filterable by what the work turned out to be.
+
+The prompt side of this contract is `prompt.build_reporting_contract()`, which
+is injected into every agent prompt.
+
+### ledger.py
+Append-only JSONL at `<workflow-dir>/.stokowski/ledger.jsonl`, recording each
+stage, each gate decision, and each terminal outcome.
+
+Stokowski keeps no database, which is fine for scheduling and useless for the
+question that matters once you are running dozens of tickets a week: is this
+working, and for what? A Linear issue holds one run's report; it cannot tell
+you that `bug-fix` work lands 95% of the time while `improvement` lands 50%,
+or whether the agent's own `high` confidence predicts anything.
+
+The human verdict is taken from gate decisions already in the workflow —
+approved means accepted, rework means sent back. No separate rating step: the
+judgement was always being made, it just was not written down.
+
+Attribution uses the FIRST stage that declared a classification (the
+investigation that framed the work). A later stage's self-assessment is not
+independent of the work it just did.
+
+`stokowski --stats` prints the summary. Rates below 10 decisions are shown with
+their sample size rather than as a bare percentage, because a 1-for-1 reading
+as 100% is how a ledger starts lying to you.
+
+### studio.py
+Backs `/studio` on the dashboard: the pipeline at a glance, plus editing for
+the obvious knobs. Modelled on the content-pipeline studio — the config file
+stays the source of truth and this is a view onto it that can write back.
+
+Two properties do the work:
+
+**Comments survive.** The comments in a workflow file are its documentation.
+PyYAML keeps 7 of 193 on the shipped example and collapses 310 lines to 131, so
+round-tripping goes through `ruamel.yaml` with `indent(mapping=2, sequence=4,
+offset=2)` — which reproduces the hand-written file byte for byte. A single
+field edit changes exactly one line.
+
+**An invalid config is never written.** Every edit is rendered, written to a
+temp file *inside the workflow directory* (so relative prompt paths resolve as
+they will at runtime), parsed and validated. Only then is it committed, via
+`os.replace`. The orchestrator re-parses config on every poll tick, so a bad or
+torn write is a live failure.
+
+Edits are confined to a whitelist (`ROOT_FIELDS`, `STATE_FIELDS`). Structural
+changes — adding states, rewiring transitions — stay in the file where a diff
+shows what happened. `tracker.api_key` is deliberately absent.
+
+Note the route ordering constraint in `web.py`: `/api/v1/{issue_identifier}`
+matches any single segment, so every literal `/api/v1/...` route must be
+declared before it.
+
 ### web.py
 Optional FastAPI app returned by `create_app(orch)`. Routes:
 - `GET /` — HTML dashboard (IBM Plex Mono font, dark theme, amber accents)
@@ -208,7 +353,7 @@ Three-layer prompt assembly for state machine workflows. Main entry point is `as
 
 **`build_lifecycle_section()`** generates the auto-injected lifecycle section appended to every prompt. Includes issue metadata, rework context with review comments, recent activity, available transitions, and completion instructions. Clearly demarcated with HTML comments.
 
-**`assemble_prompt()`** orchestrates the three layers: loads and renders global prompt, loads and renders stage prompt, generates lifecycle section, joins with double newlines.
+**`assemble_prompt()`** orchestrates the three layers: loads and renders every global prompt named by the workflow (in order), loads and renders stage prompt, generates lifecycle section, joins with double newlines.
 
 ### tracking.py
 State machine tracking via structured Linear comments:
@@ -247,17 +392,64 @@ The agent itself handles: moving Linear state, posting comments, creating branch
 
 ## Stream-json event format
 
-Claude Code emits NDJSON on stdout when run with `--output-format stream-json --verbose`. Key event types:
+Claude Code emits NDJSON on stdout under `--output-format stream-json --verbose`.
+Parsing lives in `events.py`; `tests/fixtures/real_turn.ndjson` is an unedited
+capture, and `tests/test_events.py` asserts against it. **Verify any change here
+against a real capture rather than against this document.**
 
 ```json
-{"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
-{"type": "tool_use", "name": "Bash", "input": {"command": "..."}}
-{"type": "result", "session_id": "uuid", "usage": {"input_tokens": 1234, "output_tokens": 456, "total_tokens": 1690}, "result": "final message text"}
+{"type":"system","subtype":"init","session_id":"uuid","model":"claude-sonnet-4-6","tools":[…]}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"…"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{…}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,…}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1788181200}}
+{"type":"result","subtype":"success","session_id":"uuid","usage":{…},"modelUsage":{…},"total_cost_usd":0.079,"num_turns":2,"stop_reason":"end_turn","permission_denials":[]}
 ```
 
-Exit code 0 = success. Non-zero = failure (stderr captured for error message).
+Three things about this shape bite repeatedly:
+
+- **There is no top-level `tool_use` event.** Tool calls are content blocks
+  inside `assistant` messages; their outcomes are `tool_result` blocks inside
+  `user` messages. Parsing for a top-level event yields a dashboard that shows
+  nothing but "running" — which is exactly what shipped before v0.6.
+- **`usage` has no `total_tokens` field**, and `cache_creation_input_tokens` /
+  `cache_read_input_tokens` normally dwarf `input_tokens` by two orders of
+  magnitude. A measured trivial turn: 4 input, 150 output, 10,479 cache-write,
+  45,255 cache-read. Summing only input+output reports 154 of 55,888.
+- **`usage` is per invocation, not per session.** A worker running many turns
+  via `--resume` must accumulate; assigning reports only the final turn.
+
+`total_cost_usd` is authoritative — prefer it over computing cost from tokens.
+
+Exit code 0 = success, non-zero = failure (stderr captured). Note that
+`is_error: true` on a `result` event (e.g. `error_max_turns`) still exits 0, so
+the exit code alone is not sufficient.
 
 ---
+
+## Running it
+
+`package.json` carries script aliases for people who reach for `pnpm` first;
+they wrap `scripts/stokowski.sh`, which finds the CLI (activated venv → local
+`.venv` → PATH) and the workflow file, so nothing depends on remembering where
+the virtualenv lives. Run them from the directory holding your `workflow.yaml`
+— usually the operator directory, not this repo.
+
+```bash
+pnpm start      # run the orchestrator; opens the dashboard
+pnpm studio     # same process, opens /studio instead
+pnpm check      # --dry-run
+pnpm stats      # ledger summary
+pnpm test       # pytest
+```
+
+The dashboard and the studio are one process — `/studio` is a route on it, not
+a second server. `pnpm studio` differs from `pnpm start` only in which page it
+opens, reading `server.port` out of the config to build the URL.
+
+The local `.venv` is checked before PATH deliberately: a stale global install
+silently running old code against new config is a genuinely confusing failure,
+and it happened during development.
 
 ## Development setup
 
@@ -274,13 +466,16 @@ stokowski -v
 # Run with web dashboard
 stokowski --port 4200
 
-# Run unit tests
-python -m unittest discover -s tests -v
+# Run the full test suite
+scripts/test.sh
 ```
 
-Focused unit tests cover config parsing, Linear query filters, and assignee
-reconciliation. End-to-end behavior is best verified by running `--dry-run`
-against a real Linear project with a test ticket.
+`tests/` covers the parts that fail silently: stream-json parsing (against a
+real captured fixture), artifact git-isolation (against real `git status`),
+report rendering, Codex process behavior, config parsing, Linear query filters,
+and assignee reconciliation. End-to-end dispatch and gate behavior is still
+best verified by running `--dry-run` against a real Linear project with a test
+ticket.
 
 ---
 
@@ -292,6 +487,14 @@ against a real Linear project with a test ticket.
 3. Update `orchestrator.py` to instantiate the right client based on `cfg.tracker.kind`
 4. Update `validate_config()` to handle the new kind
 
+### Running against a project
+The workflow path is a positional argument (`stokowski /path/to/workflow.yaml`),
+so an operator directory needs only `workflow.yaml`, `prompts/` and `.env` —
+**not** a checkout of this repo. Keeping a full clone as the operator directory
+pins that deployment to whatever version it was cloned at, and `python -m
+stokowski` run from inside it will import the local `stokowski/` package in
+preference to anything installed, silently running old code against new config.
+
 ### Adding config fields
 1. Add the field to the relevant dataclass in `config.py`
 2. Parse it in `parse_workflow_file()`
@@ -302,6 +505,32 @@ against a real Linear project with a test ticket.
 `web.py` is self-contained. The HTML/CSS/JS is inline in the `HTML` constant. The dashboard is intentionally dependency-free on the frontend — no build step, no npm.
 
 ### Common pitfalls
+- **Never trust a documented event shape over a captured one.** The parser bug
+  fixed in v0.6 existed because this file described a `{"type":"tool_use"}`
+  event that the CLI has never emitted. Capture a real stream and read it.
+- **Cache tokens are the token count.** Any usage arithmetic that ignores
+  `cache_read_input_tokens` is wrong by roughly two orders of magnitude.
+- **Agent evidence must go inside the workspace.** Tools that produce it will
+  not write outside their cwd. Isolate with `.git/info/exclude`, not
+  `.gitignore`.
+- **Headless bans interactivity, not tooling.** Slash commands, skills and
+  subagents all work under `claude -p` and are usually the best work available.
+  Only plan mode, brainstorming and confirmation prompts must be excluded.
+- **`/api/v1/{issue_identifier}` is a catch-all.** Any literal route under
+  `/api/v1` must be declared before it or it will 404 as an unknown issue.
+- **Never round-trip a workflow file through PyYAML.** It destroys the comments
+  that document it. Use `studio._yaml()`.
+- **`max_turns` does nothing in state machine mode.** Each dispatch is exactly
+  one `claude -p` invocation — the state machine controls continuation — and
+  the CLI has no `--max-turns` flag, so the value reaches neither the loop nor
+  the agent. It applies to legacy multi-turn workflows only.
+- **A run is bounded by time, not money.** `turn_timeout_ms` and
+  `stall_timeout_ms` are the guards. `--max-budget-usd` was tried and removed:
+  it caps *API* spend, and Stokowski runs on a Claude subscription where there
+  is no dollar meter for it to read, so it either did nothing or halted a run
+  for a reason that did not apply.
+- **`--resume` needs a session id captured from `system/init`.** Reading it
+  only from `result` loses the session on any turn that stalls or times out.
 - **`tty.setraw` vs `tty.setcbreak`**: Don't switch back to `setraw`. It disables `OPOST` output processing and causes Rich log lines to render diagonally (no carriage return on newlines).
 - **`Issue(title=...)` is required**: Minimal Issue constructors (in `linear.py` `fetch_issues_by_states` and the `orchestrator.py` state-check default) must pass `title=""` — it's a required positional field.
 - **`--verbose` with stream-json**: Claude Code requires `--verbose` when using `--output-format stream-json`. Without it you get an error.
