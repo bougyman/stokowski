@@ -49,6 +49,39 @@ class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
         return Issue(id="issue-1", identifier="SYN-1", title="Example")
 
     @patch("stokowski.runner.build_codex_args")
+    async def test_closes_subprocess_stdin(self, build_args):
+        script = (
+            "import json\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': {}}), flush=True)\n"
+        )
+        build_args.return_value = [sys.executable, "-c", script]
+        create_subprocess_exec = asyncio.create_subprocess_exec
+        spawn_kwargs = {}
+
+        async def capture_spawn(*args, **kwargs):
+            spawn_kwargs.update(kwargs)
+            return await create_subprocess_exec(*args, **kwargs)
+
+        with TemporaryDirectory() as directory:
+            with patch(
+                "stokowski.runner.asyncio.create_subprocess_exec",
+                side_effect=capture_spawn,
+            ):
+                attempt = await run_codex_turn(
+                    model=None,
+                    hooks_cfg=HooksConfig(),
+                    prompt="Investigate",
+                    workspace_path=Path(directory),
+                    issue=self.issue(),
+                    attempt=self.attempt(),
+                    turn_timeout_ms=2_000,
+                    stall_timeout_ms=500,
+                )
+
+        self.assertEqual(attempt.status, "succeeded")
+        self.assertIs(spawn_kwargs["stdin"], asyncio.subprocess.DEVNULL)
+
+    @patch("stokowski.runner.build_codex_args")
     async def test_parses_and_logs_json_events(self, build_args):
         events = [
             {"type": "thread.started", "thread_id": "thread-1"},

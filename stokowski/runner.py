@@ -251,6 +251,7 @@ async def run_codex_turn(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=str(workspace_path),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
