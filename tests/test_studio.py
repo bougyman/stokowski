@@ -172,6 +172,20 @@ def test_model_fields_advertise_the_catalogue(studio):
     labels = [g["label"] for g in d["model_catalogue"]]
     assert any("Claude" in l for l in labels)
     assert any("Codex" in l for l in labels)
+    models = {
+        model
+        for group in d["model_catalogue"]
+        for model in group["models"]
+    }
+    assert {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+    } <= models
+    assert "claude-fable-5" not in models
 
 
 def test_a_model_in_use_but_not_in_the_catalogue_is_still_offered(studio, workflow):
