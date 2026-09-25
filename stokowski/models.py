@@ -80,6 +80,7 @@ class RunAttempt:
     last_message: str = ""
     completed_at: datetime | None = None
     state_name: str | None = None       # current internal state machine state
+    state_run: int | None = None        # run number captured at dispatch
 
     # ── Usage ────────────────────────────────────────────────────────────
     # Cache tokens are tracked separately because they dominate real runs and
