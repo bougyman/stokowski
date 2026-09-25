@@ -19,6 +19,7 @@ SUPPORTED_EFFORTS = frozenset(EFFORT_LEVELS)
 SESSION_MODES = ("inherit", "handoff", "fresh")
 AGENT_ENV_ALLOWLIST = frozenset(
     {
+        "GH_TOKEN",
         "HOME",
         "LANG",
         "LC_ALL",

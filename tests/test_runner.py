@@ -86,6 +86,7 @@ class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
             return await create_subprocess_exec(*args, **kwargs)
 
         requested_env = {
+            "GH_TOKEN": "github-token",
             "PATH": os.environ.get("PATH", ""),
             "SSH_AUTH_SOCK": "/tmp/agent.sock",
             "LINEAR_API_KEY": "declared-secret",
@@ -127,6 +128,7 @@ class CodexExecutionTests(unittest.IsolatedAsyncioTestCase):
         expected_env = {
             key: requested_env[key]
             for key in (
+                "GH_TOKEN",
                 "PATH",
                 "SSH_AUTH_SOCK",
                 "LINEAR_API_KEY",
