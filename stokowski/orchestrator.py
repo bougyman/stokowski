@@ -115,6 +115,9 @@ class Orchestrator:
         # "Entering state: implement" comments in 1.7 seconds.
         self._announced_states: set[tuple[str, str, int]] = set()
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
+        # Completion handlers run asynchronously. A state run can advance only
+        # once, even if duplicate workers complete at nearly the same time.
+        self._transitions_in_flight: set[tuple[str, str, int, str]] = set()
 
         # Eligible-but-not-dispatched (queue panel data, refreshed each tick)
         self._queued: list[dict] = []
@@ -541,8 +544,48 @@ class Orchestrator:
             extra={"linked_to": issue.identifier},
         )
 
-    async def _safe_transition(self, issue: Issue, transition_name: str):
+    def _matches_current_state_run(self, issue: Issue, attempt: RunAttempt) -> bool:
+        """Return true if this attempt still owns the current state run."""
+        return (
+            attempt.state_name is not None
+            and attempt.state_run is not None
+            and self._issue_current_state.get(issue.id) == attempt.state_name
+            and self._issue_state_runs.get(issue.id, 1) == attempt.state_run
+        )
+
+    async def _safe_transition(
+        self,
+        issue: Issue,
+        transition_name: str,
+        attempt: RunAttempt | None = None,
+    ):
         """Wrapper around _transition that logs errors instead of silently swallowing them."""
+        transition_key: tuple[str, str, int, str] | None = None
+
+        if attempt is not None:
+            if not self._matches_current_state_run(issue, attempt):
+                logger.info(
+                    f"Ignoring stale transition issue={issue.identifier} "
+                    f"state={attempt.state_name} run={attempt.state_run}",
+                    extra={"linked_to": issue.identifier},
+                )
+                return
+
+            transition_key = (
+                issue.id,
+                attempt.state_name,
+                attempt.state_run,
+                transition_name,
+            )
+            if transition_key in self._transitions_in_flight:
+                logger.info(
+                    f"Ignoring duplicate transition issue={issue.identifier} "
+                    f"state={attempt.state_name} run={attempt.state_run}",
+                    extra={"linked_to": issue.identifier},
+                )
+                return
+            self._transitions_in_flight.add(transition_key)
+
         try:
             await self._transition(issue, transition_name)
         except Exception as e:
@@ -554,6 +597,9 @@ class Orchestrator:
             )
             # Release claimed so the issue can be retried on next tick
             self.claimed.discard(issue.id)
+        finally:
+            if transition_key is not None:
+                self._transitions_in_flight.discard(transition_key)
 
     async def _transition(self, issue: Issue, transition_name: str):
         """Follow a transition from the current state.
@@ -1109,6 +1155,7 @@ class Orchestrator:
             issue_identifier=issue.identifier,
             attempt=attempt_num,
             state_name=state_name,
+            state_run=self._issue_state_runs.get(issue.id, 1),
             runner_type=state_cfg.runner if state_cfg else "claude",
             session_mode=state_cfg.session if state_cfg else "inherit",
         )
@@ -1135,6 +1182,7 @@ class Orchestrator:
             if not attempt.state_name:
                 state_name, run = await self._resolve_current_state(issue)
                 attempt.state_name = state_name
+                attempt.state_run = run
                 state_cfg = self._states_for(issue).get(state_name)
                 if state_cfg and state_cfg.type == "gate":
                     # Issue should be at a gate, not running
@@ -1142,6 +1190,8 @@ class Orchestrator:
                     return
 
             state_name = attempt.state_name
+            if attempt.state_run is None:
+                attempt.state_run = self._issue_state_runs.get(issue.id, 1)
             state_cfg = self._states_for(issue).get(state_name) if state_name else None
 
             claude_cfg = self.cfg.claude
@@ -1333,6 +1383,15 @@ class Orchestrator:
 
                     if attempt.status != "succeeded":
                         break
+
+            if state_name and state_cfg and not self._matches_current_state_run(issue, attempt):
+                logger.info(
+                    f"Discarding stale worker completion issue={issue.identifier} "
+                    f"state={attempt.state_name} run={attempt.state_run}",
+                    extra={"linked_to": issue.identifier},
+                )
+                self._on_worker_exit(issue, attempt)
+                return
 
             try:
                 continuity_report = report_mod.load(ws.path, attempt.result_text)
@@ -1696,18 +1755,30 @@ class Orchestrator:
         if attempt.status != "canceled":
             self._last_completed_at[issue.id] = completed_at
 
-        self.running.pop(issue.id, None)
-        self._tasks.pop(issue.id, None)
-        self._release_slot(issue.id)
+        is_current_worker = self.running.get(issue.id) is attempt
+        is_current_state_run = self._matches_current_state_run(issue, attempt)
+
+        if is_current_worker:
+            self.running.pop(issue.id, None)
+            self._tasks.pop(issue.id, None)
+            self._release_slot(issue.id)
 
         if attempt.status == "succeeded":
-            if attempt.state_name and attempt.state_name in self._states_for(issue):
+            if (
+                is_current_worker
+                and is_current_state_run
+                and attempt.state_name in self._states_for(issue)
+            ):
                 # State machine mode: transition via "complete"
-                asyncio.create_task(self._safe_transition(issue, "complete"))
-            else:
+                asyncio.create_task(self._safe_transition(issue, "complete", attempt))
+            elif is_current_worker and not attempt.state_name:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
-        elif attempt.status in ("failed", "timed_out", "stalled"):
+        elif (
+            is_current_worker
+            and (not attempt.state_name or is_current_state_run)
+            and attempt.status in ("failed", "timed_out", "stalled")
+        ):
             current_attempt = (attempt.attempt or 0) + 1
             delay = min(
                 10_000 * (2 ** (current_attempt - 1)),
@@ -1719,7 +1790,7 @@ class Orchestrator:
                 delay_ms=delay,
                 error=attempt.error,
             )
-        else:
+        elif is_current_worker:
             self.claimed.discard(issue.id)
 
     def _schedule_retry(
