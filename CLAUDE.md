@@ -132,6 +132,8 @@ routes `investigate` straight to a gate fails the suite.
 
 **Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and posts a structured tracking comment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state.
 
+**Run numbers count one gate's rework cycle.** Rework increments the run, and the `complete` transitions that lead back to the gate keep it. Approval resets it to 1, so each gate's `max_rework` counts only its own cycle. A later rework can revisit a `(state, run)` pair that was announced before, so approval and rework both clear the issue's announce-once keys.
+
 **Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
 
 ### Workspace isolation
@@ -202,6 +204,13 @@ while running:
 2. `_is_eligible()` checks: valid fields, active state, not already running/claimed, blockers resolved
 3. Per-state concurrency limits checked against `max_concurrent_agents_by_state`
 4. `_dispatch()` creates a `RunAttempt`, adds to `self.running`, spawns `_run_worker` task
+
+**One worker per issue.** `_dispatch()` refuses an issue that is already in
+`self.running`, and `_handle_retry()` skips one. A second worker would replace
+the first in `self.running`. `_on_worker_exit()` then discards the first
+worker's successful completion as superseded, and the issue stops advancing.
+An agent-state transition claims the issue before it schedules its retry, so
+the retry is the only dispatch path for the new state.
 
 **Reconciliation:** on each tick, fetches current states for all running issue IDs. If an issue moved to terminal state → cancel worker + clean workspace. If moved out of active states → cancel worker, release claim.
 
