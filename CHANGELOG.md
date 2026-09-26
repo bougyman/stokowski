@@ -25,6 +25,8 @@ All notable changes to Stokowski are documented here.
 - Stream readable Codex JSONL activity into the terminal and dashboard, drain diagnostic stderr concurrently, report hook completion and captured output, and kill the complete Codex process group after stalls or timeouts.
 - Close Codex subprocess stdin so headless runs do not wait indefinitely for additional piped input.
 - Run Codex with full workspace access so autonomous turns can create branches, commit changes, and update submodules.
+- Start at most one worker per issue. Approving a gate could start two workers for the next state, and the discarded completion of the first left the issue stuck. A dropped successful completion is now logged.
+- Restart the run number at 1 after a gate approval, so later stages no longer inherit an earlier gate's rework count, and each gate's `max_rework` counts only its own cycle.
 
 ---
 

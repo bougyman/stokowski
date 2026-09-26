@@ -455,10 +455,12 @@ class Orchestrator:
             elif status == "approved":
                 gate_cfg = self._states_for(issue).get(gate_state)
                 if gate_cfg and "approve" in gate_cfg.transitions:
+                    # Approval closes the gate's rework cycle; the next stage
+                    # starts its own count at run 1, as _transition does.
                     target = gate_cfg.transitions["approve"]
                     self._issue_current_state[issue.id] = target
-                    self._issue_state_runs[issue.id] = run
-                    return target, run
+                    self._issue_state_runs[issue.id] = 1
+                    return target, 1
 
             elif status == "rework":
                 gate_cfg = self._states_for(issue).get(gate_state)
@@ -633,6 +635,13 @@ class Orchestrator:
             logger.warning(f"Transition target '{target_name}' not found in config")
             return
 
+        if transition_name == "approve":
+            # A run number counts one gate's rework cycle. Approval ends that
+            # cycle, so the stages after it start again at run 1 instead of
+            # inheriting the rework count of a gate they never went through.
+            self._issue_state_runs[issue.id] = 1
+            self._forget_announcements(issue.id)
+
         run = self._issue_state_runs.get(issue.id, 1)
 
         if target_cfg.type == "terminal":
@@ -661,7 +670,7 @@ class Orchestrator:
             # Clean up tracking state
             self._issue_current_state.pop(issue.id, None)
             self._issue_state_runs.pop(issue.id, None)
-            self._announced_states = {k for k in self._announced_states if k[0] != issue.id}
+            self._forget_announcements(issue.id)
             self._pending_gates.pop(issue.id, None)
             self.claimed.discard(issue.id)
             self.completed.add(issue.id)
@@ -671,7 +680,10 @@ class Orchestrator:
             await self._enter_gate(issue, target_name)
 
         else:
-            # Agent state — post state comment, ensure active Linear state, schedule retry
+            # Agent state — post state comment, ensure active Linear state, schedule retry.
+            # Claim the issue first: the retry below is the only dispatch for
+            # this state, so the tick's dispatch loop must not start one too.
+            self.claimed.add(issue.id)
             self._issue_current_state[issue.id] = target_name
             await self._announce_state(issue, target_name, run)
 
@@ -683,6 +695,14 @@ class Orchestrator:
                 logger.warning(f"Failed to move {issue.identifier} to active state '{active_state}'", extra={"linked_to": issue.identifier})
 
             self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
+
+    def _forget_announcements(self, issue_id: str) -> None:
+        """Drop the announce-once keys for an issue when it enters a new run.
+
+        Run numbers restart at 1 after each approval, so a later rework can
+        revisit a (state, run) pair that was already announced.
+        """
+        self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
 
     async def _announce_state(self, issue, state: str, run: int) -> None:
         """Post the entering-a-state comment, at most once per (state, run)."""
@@ -816,6 +836,7 @@ class Orchestrator:
 
                 new_run = run + 1
                 self._issue_state_runs[issue.id] = new_run
+                self._forget_announcements(issue.id)
 
                 # Recorded against the run that was rejected, not the retry, so
                 # the verdict attaches to the work a human actually judged.
@@ -892,7 +913,7 @@ class Orchestrator:
                 gate_state = self._pending_gates.pop(issue_id, None)
                 self._issue_current_state.pop(issue_id, None)
                 self._issue_state_runs.pop(issue_id, None)
-                self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
+                self._forget_announcements(issue_id)
                 self.claimed.discard(issue_id)
                 ident = self._last_issues.get(
                     issue_id, Issue(id="", identifier=issue_id, title="")
@@ -1136,6 +1157,19 @@ class Orchestrator:
 
     def _dispatch(self, issue: Issue, attempt_num: int | None = None):
         """Dispatch a worker for an issue."""
+        # One worker per issue, and so per state run. A second worker would
+        # replace the first in self.running, and the first's completion would
+        # then be discarded as superseded. The existing worker holds the slot
+        # (slots are keyed by issue), so there is nothing to release here.
+        existing = self.running.get(issue.id)
+        if existing is not None:
+            logger.warning(
+                f"Refusing duplicate dispatch issue={issue.identifier}: a worker is "
+                f"already running state={existing.state_name} run={existing.state_run}",
+                extra={"linked_to": issue.identifier},
+            )
+            return
+
         self.claimed.add(issue.id)
 
         state_name = self._issue_current_state.get(issue.id)
@@ -1758,6 +1792,17 @@ class Orchestrator:
         is_current_worker = self.running.get(issue.id) is attempt
         is_current_state_run = self._matches_current_state_run(issue, attempt)
 
+        if attempt.status == "succeeded" and attempt.state_name and not (
+            is_current_worker and is_current_state_run
+        ):
+            # Dropping a successful run stops the issue from advancing, so say so.
+            logger.warning(
+                f"Not advancing issue={issue.identifier} from state={attempt.state_name} "
+                f"run={attempt.state_run}: "
+                f"{'worker was superseded' if not is_current_worker else 'state run changed'}",
+                extra={"linked_to": issue.identifier},
+            )
+
         if is_current_worker:
             self.running.pop(issue.id, None)
             self._tasks.pop(issue.id, None)
@@ -1834,6 +1879,15 @@ class Orchestrator:
         self._retry_timers.pop(issue_id, None)
 
         if entry is None:
+            return
+
+        # A worker already owns this issue; it schedules its own follow-up on
+        # exit. Leave the claim and slot alone — they belong to that worker.
+        if issue_id in self.running:
+            logger.info(
+                f"Retry skipped issue={entry.identifier}: a worker is already running",
+                extra={"linked_to": entry.identifier},
+            )
             return
 
         # Fetch fresh candidates to check eligibility
@@ -1959,7 +2013,7 @@ class Orchestrator:
                 # Clean up state caches so stale entries don't accumulate
                 self._issue_current_state.pop(issue_id, None)
                 self._issue_state_runs.pop(issue_id, None)
-                self._announced_states = {k for k in self._announced_states if k[0] != issue_id}
+                self._forget_announcements(issue_id)
                 self._pending_gates.pop(issue_id, None)
             elif state_lower == review_lower:
                 # In review/gate state — stop worker but keep gate tracking
