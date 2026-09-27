@@ -85,8 +85,28 @@ def _oldest_first(comments: list[dict]) -> list[dict]:
     return sorted(comments, key=lambda c: c.get("createdAt") or "")
 
 
+def _tracking_entries(comments: list[dict]):
+    """Yield every tracking entry, oldest first, with ``type`` set.
+
+    The one place that parses tracking markers. A comment carrying both a state
+    and a gate marker yields the state entry first, then the gate entry.
+    """
+    for comment in _oldest_first(comments):
+        body = comment.get("body", "")
+        for kind, pattern in (("state", STATE_PATTERN), ("gate", GATE_PATTERN)):
+            match = pattern.search(body)
+            if not match:
+                continue
+            try:
+                data = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            data["type"] = kind
+            yield data
+
+
 def parse_latest_tracking(comments: list[dict]) -> dict[str, Any] | None:
-    """Parse comments (oldest-first) to find the latest state or gate tracking entry.
+    """Find the latest state or gate tracking entry.
 
     Returns a dict with keys:
         - "type": "state" or "gate"
@@ -94,52 +114,57 @@ def parse_latest_tracking(comments: list[dict]) -> dict[str, Any] | None:
 
     Returns None if no tracking comments found.
     """
+    # Sort rather than trust the caller (``_tracking_entries`` does). This
+    # function decides which state an issue resumes in; reading it off an
+    # unsorted list resolves a ticket that reached a gate back to its very
+    # first stage, with no error anywhere.
     latest: dict[str, Any] | None = None
+    for entry in _tracking_entries(comments):
+        latest = entry
+    return latest
 
-    # Sort rather than trust the caller. This function decides which state an
-    # issue resumes in; reading it off an unsorted list resolves a ticket that
-    # reached a gate back to its very first stage, with no error anywhere.
-    for comment in _oldest_first(comments):
-        body = comment.get("body", "")
 
-        state_match = STATE_PATTERN.search(body)
-        if state_match:
-            try:
-                data = json.loads(state_match.group(1))
-                data["type"] = "state"
-                latest = data
-            except json.JSONDecodeError:
-                pass
+def get_context_start_timestamp(
+    comments: list[dict], state: str, run: int
+) -> str | None:
+    """Find where the comments relevant to a run of ``state`` begin.
 
-        gate_match = GATE_PATTERN.search(body)
-        if gate_match:
-            try:
-                data = json.loads(gate_match.group(1))
-                data["type"] = "gate"
-                latest = data
-            except json.JSONDecodeError:
-                pass
+    Normally this is the latest tracking comment. When the run was entered
+    from a gate decision (``approved`` or ``rework``), it is the gate's
+    ``waiting`` comment instead. A human writes their instructions while the
+    issue waits at the gate and only then acts on it, so the orchestrator's
+    decision and state-entry comments always come after those instructions.
+    Starting the window at the latest tracking comment dropped them.
+    """
+    latest: str | None = None
+    waiting: str | None = None
+    entered_from_gate = False
 
+    for entry in _tracking_entries(comments):
+        timestamp = entry.get("timestamp")
+        is_this_run = (
+            entry["type"] == "state"
+            and entry.get("state") == state
+            and entry.get("run", 1) == run
+        )
+        if not is_this_run:
+            entered_from_gate = (
+                entry["type"] == "gate" and entry.get("status") in ("approved", "rework")
+            )
+        if entry["type"] == "gate" and entry.get("status") == "waiting":
+            waiting = timestamp or waiting
+        latest = timestamp or latest
+
+    if entered_from_gate and waiting:
+        return waiting
     return latest
 
 
 def get_last_tracking_timestamp(comments: list[dict]) -> str | None:
     """Find the timestamp of the latest tracking comment."""
     latest_ts: str | None = None
-
-    for comment in _oldest_first(comments):
-        body = comment.get("body", "")
-        for pattern in (STATE_PATTERN, GATE_PATTERN):
-            match = pattern.search(body)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                    ts = data.get("timestamp")
-                    if ts:
-                        latest_ts = ts
-                except json.JSONDecodeError:
-                    pass
-
+    for entry in _tracking_entries(comments):
+        latest_ts = entry.get("timestamp") or latest_ts
     return latest_ts
 
 

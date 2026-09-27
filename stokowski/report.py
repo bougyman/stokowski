@@ -31,6 +31,11 @@ REPORT_MARKER = "<!-- stokowski:report -->"
 # Where the agent is told to write its report, relative to the workspace root.
 REPORT_PATH = Path(".stokowski") / "report.json"
 
+# Where the follow-ups a report proposes are kept for a later stage. The report
+# itself is consumed once it is posted; this copy is what a stage that creates
+# the approved follow-ups reads, so it copies them instead of re-deriving them.
+FOLLOW_UPS_PATH = Path(".stokowski") / "follow-ups.json"
+
 # Fenced-block fallback, in case the agent puts the report in its final message
 # instead of writing the file.
 _FENCE = re.compile(
@@ -114,6 +119,112 @@ def load(workspace_path: Path, result_text: str = "") -> dict[str, Any] | None:
     return None
 
 
+def verdict_of(report: dict[str, Any] | None) -> str | None:
+    """The report's verdict, normalised. The one place that normalises it."""
+    if not report:
+        return None
+    verdict = _text(report.get("verdict")).lower().replace("_", "-")
+    return verdict or None
+
+
+def is_blocked(verdict: str | None) -> bool:
+    """Whether a verdict says the stage could not do its job (the ⛔ ones)."""
+    return VERDICTS.get(verdict or "", ("", ""))[0] == "⛔"
+
+
+def _scalar(value: Any) -> str:
+    """A string or number as trimmed text; anything else as empty."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return _text(value)
+
+
+def follow_ups_of(report: dict[str, Any] | None) -> tuple[list[dict[str, Any]], int]:
+    """The complete follow-ups a report proposes, and how many were incomplete.
+
+    A follow-up is complete when it has an ``id``, a ``title`` and a
+    ``description``. ``priority`` and ``labels`` are optional. Incomplete ones
+    and repeated ids are dropped: a stage that creates follow-ups must be able
+    to copy each one as written.
+    """
+    if not report:
+        return [], 0
+    complete: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    dropped = 0
+    for item in _as_list(report.get("follow_ups")):
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        fid = _scalar(item.get("id"))
+        title, description = (_text(item.get(k)) for k in ("title", "description"))
+        if not (fid and title and description) or fid in seen:
+            dropped += 1
+            continue
+        seen.add(fid)
+        entry: dict[str, Any] = {"id": fid, "title": title, "description": description}
+        priority = _scalar(item.get("priority")).lower()
+        if priority:
+            entry["priority"] = priority
+        labels = [_text(label) for label in _as_list(item.get("labels")) if _text(label)]
+        if labels:
+            entry["labels"] = labels
+        complete.append(entry)
+    return complete, dropped
+
+
+def save_follow_ups(
+    workspace_path: Path, report: dict[str, Any] | None, *, state: str, run: int
+) -> None:
+    """Keep a report's follow-ups for the stage that creates the approved ones.
+
+    Only a report with a ``follow_ups`` key replaces the file, so a later
+    stage's report cannot erase what a human approved. An empty list does
+    replace it: a rework that withdraws every follow-up must not leave the old
+    ones behind.
+    """
+    if not report or "follow_ups" not in report:
+        return
+    follow_ups, _ = follow_ups_of(report)
+    path = workspace_path / FOLLOW_UPS_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"state": state, "run": run, "follow_ups": follow_ups}, indent=2) + "\n"
+        )
+    except OSError as e:
+        logger.warning(f"Could not save follow-ups at {path}: {e}")
+
+
+def _render_follow_ups(report: dict[str, Any]) -> list[str]:
+    """The proposed follow-ups, each exactly as it would be created."""
+    follow_ups, dropped = follow_ups_of(report)
+    if not follow_ups and not dropped:
+        return []
+    out = ["### Proposed follow-ups", ""]
+    for item in follow_ups:
+        out.append(f"#### {item['id']} — {item['title']}")
+        meta = []
+        if item.get("priority"):
+            meta.append(f"priority `{item['priority']}`")
+        if item.get("labels"):
+            meta.append("labels " + ", ".join(f"`{label}`" for label in item["labels"]))
+        if meta:
+            out.append(" · ".join(meta))
+        out.append("")
+        out.append("> " + item["description"].replace("\n", "\n> "))
+        out.append("")
+    if dropped:
+        out.append(
+            f"⚠️ {dropped} follow-up(s) omitted: each needs a unique `id`, a "
+            "`title` and a `description`, so they cannot be created."
+        )
+        out.append("")
+    return out
+
+
 def discard(workspace_path: Path) -> None:
     """Remove a consumed report so the next stage cannot re-post it."""
     path = workspace_path / REPORT_PATH
@@ -159,7 +270,7 @@ def _render_recommendation(report: dict[str, Any]) -> list[str]:
     Rendered as a blockquote so it reads as a distinct panel in Linear rather
     than as more prose.
     """
-    verdict_raw = _text(report.get("verdict")).lower().replace("_", "-")
+    verdict_raw = verdict_of(report) or ""
     icon, label = VERDICTS.get(verdict_raw, ("▶", verdict_raw.replace("-", " ").title()))
     recommendation = _text(report.get("next"))
     steps = [_text(s) for s in _as_list(report.get("next_steps")) if _text(s)]
@@ -403,6 +514,8 @@ def render(
                 [a for a in _as_list(report.get("artifacts"))], uploaded
             )
         )
+
+    out.extend(_render_follow_ups(report))
 
     out.extend(_bullets("Assumptions made", _as_list(report.get("assumptions"))))
     out.extend(_bullets("Risks", _as_list(report.get("risks"))))

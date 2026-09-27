@@ -11,6 +11,9 @@ All notable changes to Stokowski are documented here.
 - feat: optionally scope each Linear tracker to issues assigned to the API key's authenticated user with `tracker.assignee: me`
 - feat: configure reasoning effort for either runner with the shared per-state
   `effort` field, including `max` for Codex
+- feat: a state can declare a `blocked` transition. A successful run whose report says `"verdict": "blocked"` follows it instead of `complete`, so a blocked merge waits at a gate instead of marking the issue done.
+- feat: reports can propose `follow_ups` (`id`, `title`, `description`, optional `priority` and `labels`). They render in the Linear comment and are saved to `.stokowski/follow-ups.json` for the stage that creates the approved ones.
+- feat: prompt templates can use the `issue` object, e.g. `{{ issue.identifier }}`.
 
 ### Changed
 
@@ -26,6 +29,7 @@ All notable changes to Stokowski are documented here.
 - Close Codex subprocess stdin so headless runs do not wait indefinitely for additional piped input.
 - Run Codex with full workspace access so autonomous turns can create branches, commit changes, and update submodules.
 - Start at most one worker per issue. Approving a gate could start two workers for the next state, and the discarded completion of the first left the issue stuck. A dropped successful completion is now logged.
+- Include the comments a human writes while an issue waits at a gate in the next stage's prompt. The window used to start after the orchestrator's own approval and state-entry comments, which hid them.
 - Restart the run number at 1 after a gate approval, so later stages no longer inherit an earlier gate's rework count, and each gate's `max_rework` counts only its own cycle.
 
 ---

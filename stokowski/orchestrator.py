@@ -1427,16 +1427,19 @@ class Orchestrator:
                 self._on_worker_exit(issue, attempt)
                 return
 
+            # Loaded once: the verdict that picks the exit transition must come
+            # from the same report that is posted.
+            run_report = report_mod.load(ws.path, attempt.result_text)
+            attempt.report_verdict = report_mod.verdict_of(run_report)
             try:
-                continuity_report = report_mod.load(ws.path, attempt.result_text)
-                continuity_mod.complete(ws.path, attempt, continuity_report)
+                continuity_mod.complete(ws.path, attempt, run_report)
             except Exception as e:
                 logger.warning(
                     f"Could not persist continuity for {issue.identifier}: {e}",
                     extra={"linked_to": issue.identifier},
                 )
 
-            await self._publish_run_report(issue, attempt, ws.path, state_name)
+            await self._publish_run_report(issue, attempt, ws.path, state_name, run_report)
 
             self._on_worker_exit(issue, attempt)
 
@@ -1556,6 +1559,7 @@ class Orchestrator:
         attempt: RunAttempt,
         workspace_path: Path,
         state_name: str | None,
+        report: dict[str, Any] | None,
     ) -> None:
         """Upload evidence, post the run report, and apply the classification label.
 
@@ -1604,12 +1608,6 @@ class Orchestrator:
             )
 
         # ── Report ──────────────────────────────────────────────────────────
-        try:
-            report = report_mod.load(workspace_path, attempt.result_text)
-        except Exception as e:
-            logger.warning(f"Could not load report: {e}", extra={"linked_to": issue.identifier})
-            report = None
-
         if report is None and not uploaded and attempt.status != "succeeded":
             # A run that failed with nothing to show gets the normal retry
             # machinery rather than a comment saying so on every attempt.
@@ -1658,6 +1656,12 @@ class Orchestrator:
             )
         else:
             logger.warning("Failed to post run report", extra={"linked_to": issue.identifier})
+
+        # Before the report is discarded below: a later stage creates the
+        # approved follow-ups from this copy. Only from a successful run whose
+        # report was posted — a human approves ids they can see.
+        if posted and attempt.status == "succeeded":
+            report_mod.save_follow_ups(workspace_path, report, state=state, run=run)
 
         # ── Classification label ────────────────────────────────────────────
         await self._apply_classification_label(client, issue, report)
@@ -1771,6 +1775,30 @@ class Orchestrator:
             if isinstance(result_text, str) and result_text:
                 logger.info(f"[{identifier}] result: {result_text[:160]}", extra=extra)
 
+    def _exit_transition(self, issue: Issue, attempt: RunAttempt) -> str:
+        """Name the transition a successful run takes out of its state.
+
+        A run can succeed as a process and still report that it could not do
+        its job — merge finding an unapproved PR, for one. Following
+        "complete" then marks the issue done with the work undone. Every ⛔
+        verdict (blocked, cannot-verify, not-reproducible) counts. A state opts
+        in by declaring a "blocked" transition; without one, a blocked report
+        still follows "complete", as before.
+        """
+        state_cfg = self._states_for(issue).get(attempt.state_name or "")
+        if (
+            report_mod.is_blocked(attempt.report_verdict)
+            and state_cfg is not None
+            and "blocked" in state_cfg.transitions
+        ):
+            logger.info(
+                f"Run reported blocked issue={issue.identifier} "
+                f"state={attempt.state_name}: following 'blocked' transition",
+                extra={"linked_to": issue.identifier},
+            )
+            return "blocked"
+        return "complete"
+
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
         """Handle worker completion."""
         self.total_input_tokens += attempt.input_tokens
@@ -1814,8 +1842,12 @@ class Orchestrator:
                 and is_current_state_run
                 and attempt.state_name in self._states_for(issue)
             ):
-                # State machine mode: transition via "complete"
-                asyncio.create_task(self._safe_transition(issue, "complete", attempt))
+                # State machine mode: transition via "complete", or via
+                # "blocked" when the run reports it is blocked and the state
+                # declares where a blocked run goes (usually a gate).
+                asyncio.create_task(
+                    self._safe_transition(issue, self._exit_transition(issue, attempt), attempt)
+                )
             elif is_current_worker and not attempt.state_name:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)

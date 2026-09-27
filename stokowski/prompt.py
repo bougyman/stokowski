@@ -22,7 +22,7 @@ from .config import (
     global_prompt_paths,
 )
 from .models import Issue
-from .tracking import get_comments_since, get_last_tracking_timestamp
+from .tracking import get_comments_since, get_context_start_timestamp
 
 log = logging.getLogger(__name__)
 
@@ -101,9 +101,13 @@ def build_template_context(
         last_run_at: ISO timestamp of the last run, if any.
 
     Returns:
-        A flat dict suitable for Jinja2 rendering.
+        A dict suitable for Jinja2 rendering.
     """
     return {
+        # The issue itself, for templates that write `{{ issue.identifier }}`.
+        # Undefined names render as empty strings, so without it those
+        # templates silently lost the issue identifier, title and URL.
+        "issue": issue,
         "issue_id": issue.id,
         "issue_identifier": issue.identifier,
         "issue_title": issue.title,
@@ -381,6 +385,20 @@ def build_reporting_contract() -> list[str]:
         "of your conclusion, not a plan you set out with."
     )
     lines.append("")
+    lines.append(
+        "7. **Say when you are blocked.** If you could not do your job — a PR "
+        "without approval, evidence you could not reach — set `verdict` to "
+        "`blocked` (or `cannot-verify`, `not-reproducible`) and give the reason "
+        "in `next`. If this state lists a `blocked` transition, that is where "
+        "the issue goes next instead of `complete`."
+    )
+    lines.append(
+        "8. **Propose follow-ups only when your stage asks for them.** Put them "
+        "in `follow_ups`: objects with `id`, `title`, `description` (the "
+        "complete issue body) and optional `priority` and `labels`. Stokowski "
+        "renders them and saves them for the stage that files the approved ones."
+    )
+    lines.append("")
 
     return lines
 
@@ -466,11 +484,12 @@ def assemble_prompt(
             )
 
     # Layer 3: Lifecycle injection
-    # Filter comments to recent non-tracking ones
+    # Filter comments to the non-tracking ones this run should see, including
+    # anything a human wrote while the issue waited at the previous gate.
     recent: list[dict[str, Any]] = []
     if comments:
-        last_ts = get_last_tracking_timestamp(comments)
-        recent = get_comments_since(comments, last_ts)
+        start_ts = get_context_start_timestamp(comments, state_name, run)
+        recent = get_comments_since(comments, start_ts)
 
     lifecycle = build_lifecycle_section(
         issue=issue,

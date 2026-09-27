@@ -134,6 +134,10 @@ routes `investigate` straight to a gate fails the suite.
 
 **Run numbers count one gate's rework cycle.** Rework increments the run, and the `complete` transitions that lead back to the gate keep it. Approval resets it to 1, so each gate's `max_rework` counts only its own cycle. A later rework can revisit a `(state, run)` pair that was announced before, so approval and rework both clear the issue's announce-once keys.
 
+**Blocked runs:** A run can succeed as a process and still report that it is stuck — `merge` finding an unapproved PR, for example. Every ⛔ verdict counts: `blocked`, `cannot-verify` and `not-reproducible`. If the state declares a `blocked` transition, Stokowski follows it instead of `complete`; usually it points at a gate, so the issue waits for a human rather than being marked done with the work undone. A state without a `blocked` transition follows `complete`, as before.
+
+**Prompt comment window:** The lifecycle section shows the non-tracking comments since the latest tracking comment. When the run was entered from a gate decision (`approved` or `rework`), the window starts at that gate's `waiting` comment instead: a human writes instructions while the issue waits and only then acts, so the orchestrator's decision and entry comments always come after them. A stage's first run, and a stage reached by `complete`, still start at their own entry comment.
+
 **Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
 
 ### Workspace isolation
@@ -289,6 +293,14 @@ The rendering is deliberately unflattering. A claim with no `evidence` or
 rather than silently falling back to prose. The point is that thin work should
 look thin on the issue.
 
+A report can propose follow-up issues in `follow_ups`: a list of objects with
+`id`, `title` and `description` (the complete issue body), plus optional
+`priority` and `labels`. They render under "Proposed follow-ups", each exactly
+as it would be created. `save_follow_ups()` also writes them to
+`.stokowski/follow-ups.json` before the report is discarded, so a later stage
+creates the approved ones by copying them, not by re-deriving them from prose.
+Only a report with a `follow_ups` key replaces that file.
+
 `classification` maps to a Linear label (`stokowski/bug-fix`,
 `stokowski/improvement`, `stokowski/prototype`, …), created on the team if
 absent. This is how the board gets filterable by what the work turned out to be.
@@ -376,7 +388,7 @@ Three-layer prompt assembly for state machine workflows. Main entry point is `as
 
 **`render_template(template_str, context)`** renders a Jinja2 template with `_SilentUndefined` — missing variables render as empty strings instead of raising errors.
 
-**`build_template_context(issue, state_name, run, attempt, last_run_at)`** builds the flat dict used for Jinja2 rendering. Includes: `issue_id`, `issue_identifier`, `issue_title`, `issue_description`, `issue_url`, `issue_priority`, `issue_state`, `issue_branch`, `issue_labels`, `state_name`, `run`, `attempt`, `last_run_at`.
+**`build_template_context(issue, state_name, run, attempt, last_run_at)`** builds the dict used for Jinja2 rendering. Includes the `issue` object itself (so `{{ issue.identifier }}` works), plus flat keys: `issue_id`, `issue_identifier`, `issue_title`, `issue_description`, `issue_url`, `issue_priority`, `issue_state`, `issue_branch`, `issue_labels`, `state_name`, `run`, `attempt`, `last_run_at`.
 
 **`build_lifecycle_section()`** generates the auto-injected lifecycle section appended to every prompt. Includes issue metadata, rework context with review comments, recent activity, available transitions, and completion instructions. Clearly demarcated with HTML comments.
 
