@@ -120,11 +120,25 @@ def load(workspace_path: Path, result_text: str = "") -> dict[str, Any] | None:
 
 
 def verdict_of(report: dict[str, Any] | None) -> str | None:
-    """The report's verdict, normalised the way render() reads it."""
+    """The report's verdict, normalised. The one place that normalises it."""
     if not report:
         return None
     verdict = _text(report.get("verdict")).lower().replace("_", "-")
     return verdict or None
+
+
+def is_blocked(verdict: str | None) -> bool:
+    """Whether a verdict says the stage could not do its job (the ⛔ ones)."""
+    return VERDICTS.get(verdict or "", ("", ""))[0] == "⛔"
+
+
+def _scalar(value: Any) -> str:
+    """A string or number as trimmed text; anything else as empty."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return _text(value)
 
 
 def follow_ups_of(report: dict[str, Any] | None) -> tuple[list[dict[str, Any]], int]:
@@ -144,13 +158,14 @@ def follow_ups_of(report: dict[str, Any] | None) -> tuple[list[dict[str, Any]], 
         if not isinstance(item, dict):
             dropped += 1
             continue
-        fid, title, description = (_text(item.get(k)) for k in ("id", "title", "description"))
+        fid = _scalar(item.get("id"))
+        title, description = (_text(item.get(k)) for k in ("title", "description"))
         if not (fid and title and description) or fid in seen:
             dropped += 1
             continue
         seen.add(fid)
         entry: dict[str, Any] = {"id": fid, "title": title, "description": description}
-        priority = _text(item.get("priority")).lower()
+        priority = _scalar(item.get("priority")).lower()
         if priority:
             entry["priority"] = priority
         labels = [_text(label) for label in _as_list(item.get("labels")) if _text(label)]
@@ -255,7 +270,7 @@ def _render_recommendation(report: dict[str, Any]) -> list[str]:
     Rendered as a blockquote so it reads as a distinct panel in Linear rather
     than as more prose.
     """
-    verdict_raw = _text(report.get("verdict")).lower().replace("_", "-")
+    verdict_raw = verdict_of(report) or ""
     icon, label = VERDICTS.get(verdict_raw, ("▶", verdict_raw.replace("-", " ").title()))
     recommendation = _text(report.get("next"))
     steps = [_text(s) for s in _as_list(report.get("next_steps")) if _text(s)]

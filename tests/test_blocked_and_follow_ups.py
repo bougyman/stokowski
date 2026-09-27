@@ -273,3 +273,81 @@ def test_templates_can_use_the_issue_object():
     )
 
     assert rendered == "EXT-68: Filter unassign https://linear.app/x/EXT-68 / EXT-68"
+
+
+# ── Review follow-ups ────────────────────────────────────────────────────────
+
+
+def test_every_stuck_verdict_takes_the_blocked_transition(orchestrator):
+    declare_blocked(orchestrator)
+
+    for verdict in ("blocked", "cannot-verify", "not-reproducible"):
+        attempt = make_attempt(verdict=verdict)
+        assert orchestrator._exit_transition(make_issue(), attempt) == "blocked", verdict
+
+
+def test_numeric_ids_and_priorities_are_kept_as_text():
+    report = {"follow_ups": [{"id": 1, "title": "Fix EOF", "description": "Body", "priority": 2}]}
+
+    follow_ups, dropped = report_mod.follow_ups_of(report)
+
+    assert dropped == 0
+    assert follow_ups == [{"id": "1", "title": "Fix EOF", "description": "Body", "priority": "2"}]
+
+
+def test_the_first_run_of_a_stage_sees_no_earlier_discussion():
+    comments = _with_embedded_times([
+        _c("A long discussion before the pipeline started", "2026-09-27T09:00:00Z"),
+        _c(make_state_comment(state="investigate", run=1), "2026-09-27T10:00:00Z"),
+    ])
+
+    start = get_context_start_timestamp(comments, "investigate", 1)
+
+    assert start == "2026-09-27T10:00:00Z"
+    assert get_comments_since(comments, start) == []
+
+
+def test_a_stage_reached_by_complete_starts_at_its_own_entry():
+    comments = _with_embedded_times([
+        _c(make_state_comment(state="investigate", run=1), "2026-09-27T10:00:00Z"),
+        _c("Posted while investigate ran", "2026-09-27T10:30:00Z"),
+        _c(make_state_comment(state="ground-check", run=1), "2026-09-27T11:00:00Z"),
+    ])
+
+    start = get_context_start_timestamp(comments, "ground-check", 1)
+
+    assert start == "2026-09-27T11:00:00Z"
+
+
+def publish(orchestrator, tmp_path, report, *, posted=True, status="succeeded"):
+    client = FakeLinear()
+
+    async def post_comment(_issue_id, body):
+        client.posted.append(body)
+        return posted
+
+    client.post_comment = post_comment
+    orchestrator._linear = client
+    orchestrator._apply_classification_label = AsyncMock()
+    attempt = make_attempt(state_name="merge")
+    attempt.status = status
+    asyncio.run(orchestrator._publish_run_report(make_issue(), attempt, tmp_path, "merge", report))
+    return tmp_path / report_mod.FOLLOW_UPS_PATH
+
+
+def test_follow_ups_are_saved_once_the_report_is_posted(orchestrator, tmp_path):
+    saved = publish(orchestrator, tmp_path, {"follow_ups": [follow_up("G1")]})
+
+    assert json.loads(saved.read_text())["follow_ups"] == [follow_up("G1")]
+
+
+def test_follow_ups_are_not_saved_when_the_report_did_not_post(orchestrator, tmp_path):
+    saved = publish(orchestrator, tmp_path, {"follow_ups": [follow_up("G1")]}, posted=False)
+
+    assert not saved.exists()
+
+
+def test_follow_ups_are_not_saved_from_a_failed_run(orchestrator, tmp_path):
+    saved = publish(orchestrator, tmp_path, {"follow_ups": []}, status="failed")
+
+    assert not saved.exists()

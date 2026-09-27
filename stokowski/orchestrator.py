@@ -1427,17 +1427,19 @@ class Orchestrator:
                 self._on_worker_exit(issue, attempt)
                 return
 
+            # Loaded once: the verdict that picks the exit transition must come
+            # from the same report that is posted.
+            run_report = report_mod.load(ws.path, attempt.result_text)
+            attempt.report_verdict = report_mod.verdict_of(run_report)
             try:
-                continuity_report = report_mod.load(ws.path, attempt.result_text)
-                attempt.report_verdict = report_mod.verdict_of(continuity_report)
-                continuity_mod.complete(ws.path, attempt, continuity_report)
+                continuity_mod.complete(ws.path, attempt, run_report)
             except Exception as e:
                 logger.warning(
                     f"Could not persist continuity for {issue.identifier}: {e}",
                     extra={"linked_to": issue.identifier},
                 )
 
-            await self._publish_run_report(issue, attempt, ws.path, state_name)
+            await self._publish_run_report(issue, attempt, ws.path, state_name, run_report)
 
             self._on_worker_exit(issue, attempt)
 
@@ -1557,6 +1559,7 @@ class Orchestrator:
         attempt: RunAttempt,
         workspace_path: Path,
         state_name: str | None,
+        report: dict[str, Any] | None,
     ) -> None:
         """Upload evidence, post the run report, and apply the classification label.
 
@@ -1605,12 +1608,6 @@ class Orchestrator:
             )
 
         # ── Report ──────────────────────────────────────────────────────────
-        try:
-            report = report_mod.load(workspace_path, attempt.result_text)
-        except Exception as e:
-            logger.warning(f"Could not load report: {e}", extra={"linked_to": issue.identifier})
-            report = None
-
         if report is None and not uploaded and attempt.status != "succeeded":
             # A run that failed with nothing to show gets the normal retry
             # machinery rather than a comment saying so on every attempt.
@@ -1661,8 +1658,10 @@ class Orchestrator:
             logger.warning("Failed to post run report", extra={"linked_to": issue.identifier})
 
         # Before the report is discarded below: a later stage creates the
-        # approved follow-ups from this copy.
-        report_mod.save_follow_ups(workspace_path, report, state=state, run=run)
+        # approved follow-ups from this copy. Only from a successful run whose
+        # report was posted — a human approves ids they can see.
+        if posted and attempt.status == "succeeded":
+            report_mod.save_follow_ups(workspace_path, report, state=state, run=run)
 
         # ── Classification label ────────────────────────────────────────────
         await self._apply_classification_label(client, issue, report)
@@ -1781,13 +1780,14 @@ class Orchestrator:
 
         A run can succeed as a process and still report that it could not do
         its job — merge finding an unapproved PR, for one. Following
-        "complete" then marks the issue done with the work undone. A state
-        opts in by declaring a "blocked" transition; without one, a blocked
-        report still follows "complete", as before.
+        "complete" then marks the issue done with the work undone. Every ⛔
+        verdict (blocked, cannot-verify, not-reproducible) counts. A state opts
+        in by declaring a "blocked" transition; without one, a blocked report
+        still follows "complete", as before.
         """
         state_cfg = self._states_for(issue).get(attempt.state_name or "")
         if (
-            attempt.report_verdict == "blocked"
+            report_mod.is_blocked(attempt.report_verdict)
             and state_cfg is not None
             and "blocked" in state_cfg.transitions
         ):

@@ -385,6 +385,20 @@ def build_reporting_contract() -> list[str]:
         "of your conclusion, not a plan you set out with."
     )
     lines.append("")
+    lines.append(
+        "7. **Say when you are blocked.** If you could not do your job — a PR "
+        "without approval, evidence you could not reach — set `verdict` to "
+        "`blocked` (or `cannot-verify`, `not-reproducible`) and give the reason "
+        "in `next`. If this state lists a `blocked` transition, that is where "
+        "the issue goes next instead of `complete`."
+    )
+    lines.append(
+        "8. **Propose follow-ups only when your stage asks for them.** Put them "
+        "in `follow_ups`: objects with `id`, `title`, `description` (the "
+        "complete issue body) and optional `priority` and `labels`. Stokowski "
+        "renders them and saves them for the stage that files the approved ones."
+    )
+    lines.append("")
 
     return lines
 
