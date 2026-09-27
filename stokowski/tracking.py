@@ -123,6 +123,44 @@ def parse_latest_tracking(comments: list[dict]) -> dict[str, Any] | None:
     return latest
 
 
+def get_context_start_timestamp(
+    comments: list[dict], state: str, run: int
+) -> str | None:
+    """Find where the comments relevant to a run of ``state`` begin.
+
+    This is the latest tracking comment, with two exceptions. The orchestrator
+    posts both of them in reaction to a human, or at dispatch, so they always
+    come after the comments the run needs:
+
+    - a gate decision (``approved`` or ``rework``). A human writes their
+      instructions while the issue waits at the gate, then acts on it.
+    - the entry comment of this same state run.
+
+    Starting the window at the latest tracking comment of any kind dropped the
+    approval notes a human left at a gate.
+    """
+    start: str | None = None
+
+    for comment in _oldest_first(comments):
+        body = comment.get("body", "")
+        for kind, pattern in (("state", STATE_PATTERN), ("gate", GATE_PATTERN)):
+            match = pattern.search(body)
+            if not match:
+                continue
+            try:
+                data = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if kind == "gate" and data.get("status") in ("approved", "rework"):
+                continue
+            if kind == "state" and data.get("state") == state and data.get("run", 1) == run:
+                continue
+            if data.get("timestamp"):
+                start = data["timestamp"]
+
+    return start
+
+
 def get_last_tracking_timestamp(comments: list[dict]) -> str | None:
     """Find the timestamp of the latest tracking comment."""
     latest_ts: str | None = None

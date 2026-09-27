@@ -1429,6 +1429,7 @@ class Orchestrator:
 
             try:
                 continuity_report = report_mod.load(ws.path, attempt.result_text)
+                attempt.report_verdict = report_mod.verdict_of(continuity_report)
                 continuity_mod.complete(ws.path, attempt, continuity_report)
             except Exception as e:
                 logger.warning(
@@ -1659,6 +1660,10 @@ class Orchestrator:
         else:
             logger.warning("Failed to post run report", extra={"linked_to": issue.identifier})
 
+        # Before the report is discarded below: a later stage creates the
+        # approved follow-ups from this copy.
+        report_mod.save_follow_ups(workspace_path, report, state=state, run=run)
+
         # ── Classification label ────────────────────────────────────────────
         await self._apply_classification_label(client, issue, report)
 
@@ -1771,6 +1776,29 @@ class Orchestrator:
             if isinstance(result_text, str) and result_text:
                 logger.info(f"[{identifier}] result: {result_text[:160]}", extra=extra)
 
+    def _exit_transition(self, issue: Issue, attempt: RunAttempt) -> str:
+        """Name the transition a successful run takes out of its state.
+
+        A run can succeed as a process and still report that it could not do
+        its job — merge finding an unapproved PR, for one. Following
+        "complete" then marks the issue done with the work undone. A state
+        opts in by declaring a "blocked" transition; without one, a blocked
+        report still follows "complete", as before.
+        """
+        state_cfg = self._states_for(issue).get(attempt.state_name or "")
+        if (
+            attempt.report_verdict == "blocked"
+            and state_cfg is not None
+            and "blocked" in state_cfg.transitions
+        ):
+            logger.info(
+                f"Run reported blocked issue={issue.identifier} "
+                f"state={attempt.state_name}: following 'blocked' transition",
+                extra={"linked_to": issue.identifier},
+            )
+            return "blocked"
+        return "complete"
+
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
         """Handle worker completion."""
         self.total_input_tokens += attempt.input_tokens
@@ -1814,8 +1842,12 @@ class Orchestrator:
                 and is_current_state_run
                 and attempt.state_name in self._states_for(issue)
             ):
-                # State machine mode: transition via "complete"
-                asyncio.create_task(self._safe_transition(issue, "complete", attempt))
+                # State machine mode: transition via "complete", or via
+                # "blocked" when the run reports it is blocked and the state
+                # declares where a blocked run goes (usually a gate).
+                asyncio.create_task(
+                    self._safe_transition(issue, self._exit_transition(issue, attempt), attempt)
+                )
             elif is_current_worker and not attempt.state_name:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
