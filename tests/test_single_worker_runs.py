@@ -15,12 +15,13 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from stokowski.models import Issue, RetryEntry, RunAttempt
 from stokowski.orchestrator import Orchestrator
+from stokowski.pool import ConcurrencyPool
 from stokowski.tracking import make_gate_comment
 
 REPO = Path(__file__).resolve().parent.parent
@@ -184,3 +185,100 @@ def test_rework_after_a_reset_announces_the_revisited_run(orchestrator):
     assert orchestrator._issue_current_state[ISSUE_ID] == "implement"
     assert orchestrator._issue_state_runs[ISSUE_ID] == 2
     assert any('"state": "implement", "run": 2' in body for body in linear.posted)
+
+
+# ── Workflow stage limits ─────────────────────────────────────────────────
+
+
+def test_poll_limits_workers_by_stage(orchestrator):
+    first = make_issue()
+    second = Issue(id="issue-2", identifier="ENG-2", title="Review", state=first.state)
+    other = Issue(id="issue-3", identifier="ENG-3", title="Implement", state=first.state)
+    linear = FakeLinear(candidates=[first, second, other])
+    orchestrator._linear = linear
+    orchestrator._issue_current_state.update({
+        first.id: "code-review",
+        second.id: "code-review",
+        other.id: "implement",
+    })
+    orchestrator.pool = ConcurrencyPool(global_cap=3)
+    orchestrator._reconcile = AsyncMock()
+    orchestrator._run_worker = AsyncMock()
+
+    async def poll_twice():
+        await orchestrator._tick()
+
+        assert set(orchestrator.running) == {first.id, other.id}
+        assert orchestrator.pool.total_running() == 2
+        assert orchestrator._queued[0]["issue_id"] == second.id
+        assert orchestrator._queued[0]["reason"] == "per-state cap (code-review)"
+
+        attempt = orchestrator.running[first.id]
+        attempt.status = "canceled"
+        orchestrator._on_worker_exit(first, attempt)
+        linear.candidates = [second]
+        await orchestrator._tick()
+
+        assert set(orchestrator.running) == {second.id, other.id}
+        assert orchestrator.pool.total_running() == 2
+        assert orchestrator._queued == []
+
+    asyncio.run(poll_twice())
+
+
+def test_dispatch_preserves_limits_keyed_by_linear_status(orchestrator):
+    first = make_issue()
+    second = Issue(id="issue-2", identifier="ENG-2", title="Implement", state=first.state)
+    orchestrator.cfg.agent.max_concurrent_agents_by_state["in progress"] = 1
+    orchestrator._issue_current_state.update({first.id: "code-review", second.id: "implement"})
+    orchestrator._run_worker = AsyncMock()
+
+    async def dispatch_both():
+        assert orchestrator._dispatch(first) is None
+        assert orchestrator._dispatch(second) == "per-state cap (in progress)"
+        assert set(orchestrator.running) == {first.id}
+
+    asyncio.run(dispatch_both())
+
+
+@pytest.mark.parametrize("attempt_num", [0, 2], ids=["gate approval", "failed worker retry"])
+def test_retry_waits_for_stage_capacity(orchestrator, attempt_num):
+    issue = make_issue()
+    incumbent = Issue(id="issue-2", identifier="ENG-2", title="Review", state=issue.state)
+    linear = FakeLinear(candidates=[issue])
+    orchestrator._linear = linear
+    orchestrator._run_worker = AsyncMock()
+    del orchestrator._schedule_retry  # Use real timers for this dispatch path.
+    orchestrator._issue_current_state[incumbent.id] = "code-review"
+
+    async def check_retry():
+        orchestrator._dispatch(incumbent)
+        if attempt_num == 0:
+            approved = orchestrator.cfg.linear_states.gate_approved
+            linear.by_state[approved] = [make_issue(state=approved)]
+            orchestrator._pending_gates[issue.id] = "implementation-review"
+            await orchestrator._handle_gate_responses()
+        else:
+            orchestrator._issue_current_state[issue.id] = "code-review"
+            orchestrator.claimed.add(issue.id)
+            orchestrator._schedule_retry(issue, attempt_num, delay_ms=10_000)
+
+        orchestrator._retry_timers[issue.id].cancel()
+        await orchestrator._handle_retry(issue.id)
+
+        assert issue.id not in orchestrator.running
+        assert issue.id in orchestrator.claimed
+        assert orchestrator.retry_attempts[issue.id].attempt == attempt_num
+        assert orchestrator.retry_attempts[issue.id].error == "per-state cap (code-review)"
+
+        incumbent_run = orchestrator.running[incumbent.id]
+        incumbent_run.status = "canceled"
+        orchestrator._on_worker_exit(incumbent, incumbent_run)
+        orchestrator._retry_timers[issue.id].cancel()
+        await orchestrator._handle_retry(issue.id)
+
+        assert issue.id not in orchestrator.retry_attempts
+        assert orchestrator.running[issue.id].state_name == "code-review"
+        assert orchestrator.running[issue.id].attempt == attempt_num
+
+    asyncio.run(check_retry())
