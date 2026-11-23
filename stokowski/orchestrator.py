@@ -278,6 +278,29 @@ class Orchestrator:
             return False, "no global slot"
         return True, None
 
+    def _state_limit_reason(self, issue: Issue, stage: str | None) -> str | None:
+        limits = self.cfg.agent.max_concurrent_agents_by_state
+        stage_limit = limits.get(stage) if stage is not None else None
+        if stage_limit is not None:
+            running_in_stage = sum(attempt.state_name == stage for attempt in self.running.values())
+            if running_in_stage >= stage_limit:
+                return f"per-state cap ({stage})"
+
+        # Preserve limits keyed by Linear status. A workflow stage with the
+        # same name takes precedence over the status interpretation.
+        status = issue.state.strip().lower()
+        status_limit = limits.get(status)
+        if status_limit is not None and status not in self.cfg.all_states():
+            running_in_status = sum(
+                current.state.strip().lower() == status
+                for issue_id in self.running
+                if (current := self._last_issues.get(issue_id)) is not None
+            )
+            if running_in_status >= status_limit:
+                return f"per-state cap ({status})"
+
+        return None
+
     def _claim_slot(self, issue_id: str) -> bool:
         """Claim a pool slot for this issue. No-op for legacy path."""
         if issue_id in self._slot_held:
@@ -1081,53 +1104,16 @@ class Orchestrator:
             if not self._is_eligible(issue):
                 continue
 
-            can, reason = self._has_slot()
-            if not can:
+            reason = self._dispatch(issue)
+            if reason is not None:
                 self._queued.append({
                     "issue_id": issue.id,
                     "issue_identifier": issue.identifier,
                     "title": issue.title,
                     "priority": issue.priority,
                     "state": issue.state,
-                    "reason": reason or "blocked",
+                    "reason": reason,
                 })
-                continue
-
-            # Per-state concurrency check
-            state_key = issue.state.strip().lower()
-            state_limit = self.cfg.agent.max_concurrent_agents_by_state.get(state_key)
-            if state_limit is not None:
-                state_count = sum(
-                    1
-                    for r in self.running.values()
-                    if self._last_issues.get(r.issue_id, Issue(id="", identifier="", title="")).state.strip().lower()
-                    == state_key
-                )
-                if state_count >= state_limit:
-                    self._queued.append({
-                        "issue_id": issue.id,
-                        "issue_identifier": issue.identifier,
-                        "title": issue.title,
-                        "priority": issue.priority,
-                        "state": issue.state,
-                        "reason": f"per-state cap ({state_key})",
-                    })
-                    continue
-
-            # Reserve the global slot before _dispatch so the pool stays
-            # consistent with what we believe is in flight.
-            if not self._claim_slot(issue.id):
-                self._queued.append({
-                    "issue_id": issue.id,
-                    "issue_identifier": issue.identifier,
-                    "title": issue.title,
-                    "priority": issue.priority,
-                    "state": issue.state,
-                    "reason": "no global slot",
-                })
-                continue
-
-            self._dispatch(issue)
 
     def _is_eligible(self, issue: Issue) -> bool:
         """Check if an issue is eligible for dispatch."""
@@ -1155,8 +1141,8 @@ class Orchestrator:
 
         return True
 
-    def _dispatch(self, issue: Issue, attempt_num: int | None = None):
-        """Dispatch a worker for an issue."""
+    def _dispatch(self, issue: Issue, attempt_num: int | None = None) -> str | None:
+        """Dispatch an issue or return the reason it must wait for capacity."""
         # One worker per issue, and so per state run. A second worker would
         # replace the first in self.running, and the first's completion would
         # then be discarded as superseded. The existing worker holds the slot
@@ -1168,22 +1154,27 @@ class Orchestrator:
                 f"already running state={existing.state_name} run={existing.state_run}",
                 extra={"linked_to": issue.identifier},
             )
-            return
+            return None
 
-        self.claimed.add(issue.id)
+        can_dispatch, reason = self._has_slot()
+        if not can_dispatch:
+            return reason or "no global slot"
 
-        state_name = self._issue_current_state.get(issue.id)
-        if not state_name:
-            state_name = self._entry_state_for(issue)
-
-        # If at a gate, enter it instead of dispatching a worker.
-        # Release the slot we reserved — the gate path doesn't run an agent.
+        state_name = self._issue_current_state.get(issue.id) or self._entry_state_for(issue)
         state_cfg = self._states_for(issue).get(state_name) if state_name else None
         if state_cfg and state_cfg.type == "gate":
-            self._release_slot(issue.id)
+            self.claimed.add(issue.id)
             asyncio.create_task(self._safe_enter_gate(issue, state_name))
-            return
+            return None
 
+        reason = self._state_limit_reason(issue, state_name)
+        if reason is not None:
+            return reason
+        if not self._claim_slot(issue.id):
+            return "no global slot"
+
+        self.claimed.add(issue.id)
+        self._last_issues[issue.id] = issue
         attempt = RunAttempt(
             issue_id=issue.id,
             issue_identifier=issue.identifier,
@@ -1208,6 +1199,7 @@ class Orchestrator:
             f"attempt={attempt_num}",
             extra={"linked_to": issue.identifier},
         )
+        return None
 
     async def _run_worker(self, issue: Issue, attempt: RunAttempt):
         """Worker coroutine: prepare workspace, run agent turns."""
@@ -1947,26 +1939,14 @@ class Orchestrator:
             logger.info(f"Retry: issue {entry.identifier} no longer active, releasing", extra={"linked_to": entry.identifier})
             return
 
-        # Check slots via the same path as the dispatch loop
-        can, reason = self._has_slot()
-        if not can:
+        reason = self._dispatch(issue, attempt_num=entry.attempt)
+        if reason is not None:
             self._schedule_retry(
                 issue,
                 attempt_num=entry.attempt,
                 delay_ms=10_000,
-                error=reason or "no available orchestrator slots",
+                error=reason,
             )
-            return
-        if not self._claim_slot(issue.id):
-            self._schedule_retry(
-                issue,
-                attempt_num=entry.attempt,
-                delay_ms=10_000,
-                error="no available orchestrator slots",
-            )
-            return
-
-        self._dispatch(issue, attempt_num=entry.attempt)
 
     async def _reconcile(self):
         """Reconcile running issues against current Linear state."""
